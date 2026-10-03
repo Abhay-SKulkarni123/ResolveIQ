@@ -25,6 +25,11 @@ Nothing here is a decision I did not actually make. Where the brief was silent, 
 | ADR-015 | Deviations from the preferred stack, and why | Accepted |
 | ADR-016 | Synchronous investigation; no job queue yet | Proposed |
 | ADR-017 | Evidence keys are human-readable strings, not database IDs | Accepted |
+| ADR-018 | Deterministic constraint names in the SQLAlchemy `MetaData` | Accepted |
+| ADR-019 | Surrogate UUID keys, and `RESTRICT` on every foreign key | Accepted |
+| ADR-020 | The database checks the *shape* of money; the domain checks its *meaning* | Accepted |
+| ADR-021 | Least-privilege database role for development and tests | Accepted |
+| ADR-022 | Recalculation as pure functions over value objects; no invoice tables yet | Accepted |
 | OQ-01…OQ-10 | Open questions | Open |
 
 ---
@@ -655,6 +660,87 @@ creates it idempotently and reports the resulting privileges.
 
 ---
 
+## ADR-022 — Recalculation as pure functions over value objects, with no invoice tables yet
+
+**Status.** Accepted
+
+**Context.** The database foundation (ADR-018 to ADR-021) created `accounts`, `contracts` and
+`contract_price_terms` and nothing else. Phase 2 needs to recalculate an invoice, which appears to
+require `invoices`, `invoice_lines`, `usage_events`, `payments` and `adjustments`. Two facts argue
+against building those tables now. ADR-006 already commits to immutable evidence snapshots, so a
+recalculation is a pure function of a frozen JSONB bundle — it reads no live table. And the thing
+worth testing is the arithmetic: a wrong rate or a wrong rounding rule is a real-money defect, and
+it is fully reachable without a database.
+
+Adding five tables now would also mean guessing at columns the evidence format does not yet settle —
+whether an invoice is stored whole or per line, whether usage keeps its source-system identifiers.
+
+**Decision.** No invoice, usage, payment or adjustment tables in this phase. The calculation inputs
+are frozen dataclasses in `app/domain/billing.py`, validated at construction. The engine
+(`app/pricing/engine.py`) is a pure function of `(invoice, price_terms, usage_events, contract_id)`.
+Alongside that:
+
+- **A discrepancy is a result, not a diagnosis.** `LineRecalculation` reports that 21.86 was
+  recalculated against 28.40 recorded. It does not claim the cause. Deciding whether that is a
+  duplicate, a wrong tier boundary or a stale contract version is the investigation's job, and a
+  result with a cause attached is harder to challenge: the reviewer must disprove the diagnosis
+  before trusting the arithmetic.
+- **Three statuses, not two.** `RECALCULATED`, `ACCEPTED_AS_RECORDED` (a `FIXED` fee, which no usage
+  evidence can confirm or refute) and `UNRESOLVED`. Collapsing the last two into "no discrepancy"
+  would let a partially verified invoice read as a clean one.
+- **An unresolved line makes the total a lower bound.** `InvoiceRecalculation.is_complete` is False
+  whenever any line is unresolved, because such a line might have been wrong in either direction.
+- **Recalculation is separate from reconciliation.** `reconcile_balance()` lives in its own module and
+  takes payments and adjustments as arguments. A balance depends on events after the invoice, so
+  merging the two would make the arithmetic unverifiable without also asserting something about
+  account state.
+- **The balance uses the recalculated total**, never the invoice's stated total. Using the stated
+  total would make the two agree by construction.
+- **Payment allocations are per invoice.** `PaymentAllocation` is its own type because one remittance
+  routinely settles several invoices. A single `allocated` total cannot express a $300 payment split
+  across two invoices, and inferring the split would either ignore the payment or over-apply it.
+- **Adjustments are signed.** Positive is a credit, negative is a surcharge, so one formula —
+  `total − payments − adjustments` — covers both directions and neither can be handled correctly
+  while the other is handled backwards.
+- **Usage timestamps must be timezone-aware and are normalised to UTC.** A naive timestamp is two
+  different instants depending on who produced it, and a boundary event would then be billed in a
+  different month by two systems that both believe they are right. Period selection compares the UTC
+  calendar date, so an event at `2025-04-01T00:00+05:30` bills into March.
+- **INV-01 is enforced by AST, not by review.** `tests/unit/test_no_float_in_calculations.py` walks
+  `domain/` and `pricing/` and rejects float literals, `float()` calls, `round()`, and int/int
+  division. The `float` argument of an `isinstance` check is exempt, structurally, because both
+  `Money` and the billing inputs have to name it to reject it.
+
+**Consequences.**
+- The whole calculation path is covered by tests that need no database, and runs identically on any
+  machine. This is what makes a dispute result defensible rather than merely reproducible.
+- Nothing in this phase is wired to an API or a repository. `app/services/` and `app/api/` are
+  untouched, which is the honest state of the work rather than a half-built vertical slice.
+- Persistence is deferred, not designed around. When invoice storage is added, it will serialise
+  these value objects into the evidence snapshot; the alternative would have been to design a schema
+  now and migrate it once the evidence format settled.
+- Adding an ORM entity for any of these types later is a real cost, and ADR-020's split — database
+  checks shape, domain checks meaning — means the validation written here will not be discarded.
+
+**Alternatives rejected.**
+- *Creating `invoices`, `invoice_lines` and `usage_events` tables now* — five tables of guessed columns
+  to support a calculation that needs none of them, on evidence that is stored whole anyway (ADR-006).
+- *One `billing.py` doing recalculation and balance together* — the balance depends on post-invoice
+  events, so a single function could not be checked against contract and usage alone.
+- *Reporting an unresolved line as a zero discrepancy* — the most dangerous simplification available
+  here, and the one a reader is least likely to notice.
+- *Applying an unallocated payment to whichever invoice is open* — plausible, and it would silently
+  convert an unapplied payment (§6.3 `UNAPPLIED_PAYMENT`) into a settled account.
+- *Clamping a negative outstanding balance to zero* — it erases a refund that is genuinely due and
+  makes the account look settled.
+- *A filename allowlist for modules permitted to mention `float`* — the exemption is structural
+  (the `float` argument of an `isinstance` call) because a list would need editing every time a new
+  boundary check was added, and would silently stop applying to a renamed file.
+
+---
+
+---
+
 ## Open questions
 
 Tracked in full in `REQUIREMENTS_TRACEABILITY.md` §7. Condensed here with the decision each one blocks.
@@ -663,7 +749,7 @@ Tracked in full in `REQUIREMENTS_TRACEABILITY.md` §7. Condensed here with the d
 | --- | --- | --- | --- | --- |
 | OQ-01 | Identity source for analyst/reviewer roles | Auth, NEP-04 | Dev-mode headers, explicitly demo-grade | **High** — presenting headers as "auth" would be a false security claim |
 | OQ-02 | Are adjustments pre-tax or post-tax? | FR-010, impact calculator | Pre-tax line subtotal; tax not recomputed | High — wrong tax handling is a real-money bug |
-| OQ-03 | Rounding convention: `ROUND_HALF_UP` vs `ROUND_HALF_EVEN`? | Every computed amount | `HALF_UP` at invoice boundaries, `HALF_EVEN` for residual splits | Medium — off-by-a-cent findings against the real billing system |
+| OQ-03 | Rounding convention: `ROUND_HALF_UP` vs `ROUND_HALF_EVEN`? | Every computed amount | `HALF_UP` at invoice boundaries, `HALF_EVEN` for residual splits — now implemented in `pricing/rounding.py` and pinned by tests, so a different answer is a one-constant change | Medium — off-by-a-cent findings against the real billing system |
 | OQ-04 | Multi-currency / FX in scope? | `Money`, ADR-001 | Single currency per account; cross-currency rejected | Medium |
 | OQ-05 | Are non-monetary resolutions allowed? | FR-006 | Yes — `NO_ADJUSTMENT`, `REQUEST_MORE_INFO` | Low |
 | OQ-06 | Retention and PII policy for dispute text and snapshots | NEP-006, NFR-006 | Indefinite retention in dev; no PCI stored | Medium — a compliance finding |

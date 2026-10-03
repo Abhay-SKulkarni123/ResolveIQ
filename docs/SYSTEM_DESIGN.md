@@ -300,7 +300,7 @@ must never be presented as a clean one.
 │   │   ├── config.py                # pydantic-settings, reads env
 │   │   ├── api/                     # routers/, schemas/, deps.py, errors.py
 │   │   ├── domain/                  # entities.py, money.py, state_machines.py, evidence.py
-│   │   ├── pricing/                 # engine.py, rules/*.py, rounding.py
+│   │   ├── pricing/                 # engine.py, rules.py, results.py, reconciliation.py, trace.py, usage.py, rounding.py
 │   │   ├── services/                # dispute.py, investigation.py, review.py, adjustment.py, audit.py
 │   │   ├── ports/                   # llm.py, repositories.py
 │   │   └── adapters/
@@ -727,11 +727,11 @@ Machine-checkable where possible. Each maps to a test in Phase 1+.
 
 | ID | Invariant | Enforcement |
 | --- | --- | --- |
-| INV-01 | No monetary value is ever a `float`. | `Money` rejects `float`; DB `NUMERIC`; AST check for float literals in `pricing/` |
+| INV-01 | No monetary value is ever a `float`. | `Money` rejects `float`; DB `NUMERIC`; AST check (`tests/unit/test_no_float_in_calculations.py`) over `domain/` and `pricing/` — implemented |
 | INV-02 | No LLM output field carries a monetary amount. | Schema has no such field; contract test asserts |
 | INV-03 | Every finding cites ≥1 evidence key, all of which exist in the bundle. | `EvidenceCitationValidator` + DB check |
-| INV-04 | Sum of `invoice_line_items.amount` is recorded and compared to `invoice.stated_total`; mismatch is a finding, not an exception. | Reconciliation service |
-| INV-05 | `sum(payment_allocations.amount) <= payments.amount` per payment. | Ingest check + test |
+| INV-04 | Sum of `invoice_line_items.amount` is recorded and compared to `invoice.stated_total`; mismatch is a finding, not an exception. | `RecordedInvoice.line_total` kept distinct from `stated_total`; domain refuses a total with no lines — implemented |
+| INV-05 | `sum(payment_allocations.amount) <= payments.amount` per payment. | `Payment.__post_init__`, per-invoice `PaymentAllocation` — implemented |
 | INV-06 | At most one adjustment in `PENDING`/`APPLIED` per dispute. | Partial unique index |
 | INV-07 | An adjustment requires an `APPROVE` review decision referencing it. | FK (NOT NULL) + service guard |
 | INV-08 | An adjustment's approval must have been made against the current `evidence_fingerprint`. | Service guard → `409` |

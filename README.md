@@ -34,7 +34,8 @@ Full reasoning: [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) §1, [`docs/ENG
 
 ## ⚠️ Current status — read this first
 
-This repository is at **Phase 0 (foundation)**. Documentation is drafted; the domain does not exist yet.
+Two slices are genuinely complete: the database foundation and the deterministic billing engine.
+Everything between the evidence bundle and the model is not built.
 
 | Area | Status |
 | --- | --- |
@@ -42,9 +43,11 @@ This repository is at **Phase 0 (foundation)**. Documentation is drafted; the do
 | `Money` value object + 55 unit tests | **Implemented, verified** |
 | FastAPI app factory + `/api/v1/health` | **Implemented, verified** |
 | Docker Compose file | **Syntax validated; never actually started** (no Docker daemon on this machine) |
-| SQLAlchemy models, Alembic migrations, seed data | Not built |
-| Pricing engine, evidence pipeline, LLM adapters | Not built |
+| SQLAlchemy models, Alembic migrations, seed data | **Implemented** — 62 integration tests written, **never executed against a live server** (none reachable) |
+| Pricing engine (rules, traces, recalculation, reconciliation) | **Implemented, verified** — 221 tests, no database required (ADR-022) |
+| Evidence pipeline, LLM adapters | Not built |
 | Investigation / review / adjustment services | Not built |
+| `app/api/` beyond `/health`, `app/services/` | Not built |
 | Frontend (entirely) | Not built — `frontend/` is an empty directory |
 
 Per-requirement status is tracked in
@@ -166,11 +169,17 @@ SQLAlchemy models (`NUMERIC` money, JSONB snapshots), Alembic migration, determi
 `EvidenceCitationValidator`, investigation stage machine.
 
 **Acceptance criteria**
-- [ ] Every `hypothesis_code` calculator passes golden fixtures with hand-computed values
+- [x] Every `hypothesis_code` calculator passes golden fixtures with hand-computed values
+- [x] A test asserts `float` never appears in the `pricing/` call path
 - [ ] Schema rejects an unknown field; a money field cannot be expressed in the schema at all
 - [ ] A response citing a non-existent evidence key is **rejected entirely**
-- [ ] A test asserts `float` never appears in the `pricing/` call path
 - [ ] Killing the process mid-investigation and resuming completes without duplicating rows
+
+The pricing half of this phase is done: `PER_UNIT`, `TIERED` and `COMMITMENT` all produce exact
+amounts, a single rounding at the line boundary, and an ordered `calculation_trace` naming the
+contract term. Recalculating the §6.4 worked example returns 21.86 against a recorded 28.40. The AI
+interpretation half is untouched — there is no LLM code, no evidence pipeline and no investigation
+state machine yet.
 
 ### Phase 3 — Review & adjustment (the hard requirements)
 Review decisions, adjustment creation with all five duplicate-prevention layers, staleness, reopening,

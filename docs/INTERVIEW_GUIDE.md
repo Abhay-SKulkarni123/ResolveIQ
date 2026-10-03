@@ -10,21 +10,29 @@ part of this project is *the reasoning*, not the endpoints.
 
 ## 0. State of the repository — read this first
 
-As of the foundation phase:
-
 | Area | Status |
 | --- | --- |
 | Documentation (7 documents) | Drafted |
 | `.env.example`, `.gitignore`, `docker-compose.yml`, `Makefile` | Present |
 | `Money` value object + unit tests | **Implemented and verified** |
 | FastAPI app factory + `/api/v1/health` | Implemented, import-verified |
-| Database models, migrations, seed data | **Not built** |
-| Pricing engine, evidence pipeline, LLM adapters | **Not built** |
+| Database models, migrations, seed data | **Implemented and verified** (ADR-018…021) |
+| Pricing engine (recalculation, rules, traces, reconciliation) | **Implemented and verified** (ADR-022) |
+| Evidence pipeline, LLM adapters | **Not built** |
 | Investigation / review / adjustment services | **Not built** |
+| `app/services/` and `app/api/` beyond health | **Not built** |
 | Frontend | **Not built** (directory only) |
 
-Nothing beyond `Money` and the health endpoint exists. I would rather show one thing that is genuinely
-correct than ten that are plausible. `docs/REQUIREMENTS_TRACEABILITY.md` tracks this per requirement.
+Two things are genuinely finished and worth inspecting: the database foundation, and the deterministic
+billing engine. Everything between the evidence bundle and the model — the investigation workflow, the
+hypothesis registry, the review and adjustment services — is not built, and `app/api/` exposes only the
+health endpoint. I would rather show two things that are correct than ten that are plausible.
+`docs/REQUIREMENTS_TRACEABILITY.md` tracks this per requirement.
+
+One honest caveat on verification: the database work was verified against a real PostgreSQL instance, and
+the billing engine is verified by tests that need no database at all. The integration suite skips in this
+checkout because no database is reachable, so treat "verified" above as scoped to what each suite actually
+executed.
 
 ---
 
@@ -117,6 +125,8 @@ moves, the approval should not survive (`ADR-006`, `ADR-007`).
 | Synchronous investigation, no queue | A slow provider holds a connection; bounded by timeout + resumable `PARTIAL_FAILED` |
 | Append-only audit via `REVOKE`d grants | Needs separate migration/runtime roles |
 | Evidence snapshots duplicated per dispute | Storage cost; buys reproducibility |
+| No invoice/usage/payment tables yet; calculation inputs are value objects (ADR-022) | Nothing is wired to an API or repository; the whole engine is testable with no database, and the schema is not designed around a guess |
+| Three line statuses rather than two, so "cannot be verified" is not "no discrepancy" | More branches in every consumer of a result; a partially verified invoice can no longer be presented as clean |
 
 I would also point at what I *rejected* — `SOLID.md` has an explicit "rejected abstractions" table
 (generic `Repository[T]`, event bus, `BillingProvider` for a billing system that does not exist, DI
@@ -147,6 +157,87 @@ Points to check:
 - Is `ROUND_HALF_EVEN` used for residual distribution on purpose? Yes — it minimises systematic bias when
   splitting a total across many rows. It is intentional and tested, and `OQ-03` asks whether the client's
   billing system agrees.
+
+---
+
+## 4a. The billing engine, term by term
+
+Five concepts carry the whole design. Each is given as a definition, a worked example, and why it is
+that way, because a rule with no example is a rule nobody can check.
+
+### 4a.1 Exact decimals — never floats
+
+**Definition.** Every monetary and metered value is a `Decimal`, wrapped in `Money`. A binary float is
+rejected at the boundary rather than converted.
+
+**Example.** 0.1 + 0.2 is 0.30000000000000004 in binary floating point. A rate of $0.00070 per call over
+41,234 calls is $28.8638 — and `0.0007 * 41234` in float arithmetic does not reliably give you that. The
+engine computes `Decimal("0.00070") * 41234 = Decimal("28.86380")`, exactly.
+
+**Why.** Converting a float to `Decimal` does not recover the value the author intended; it recovers the
+nearest binary approximation, so the conversion launders the error instead of revealing it. Refusing
+floats at construction means the mistake surfaces at the point it is made, naming the field. The rule is
+enforced mechanically by `tests/unit/test_no_float_in_calculations.py`, which walks the AST of `domain/`
+and `pricing/` and rejects float literals, `float()` calls, `round()`, and int/int division.
+
+### 4a.2 One rounding, at the line boundary
+
+**Definition.** Intermediate amounts are exact. A line amount is rounded exactly once, on the way out.
+
+**Example.** A ladder with two tiers at $0.005 each, over 6 units: 3 × 0.005 = $0.015 and 3 × 0.005 =
+$0.015, summing to $0.030, which rounds to $0.03. Rounding each tier on the way past would give $0.02 +
+$0.02 = $0.04.
+
+**Why.** If the total depended on how many tiers the contract happened to have, the same usage would cost
+more under a longer ladder. That is not a rounding preference, it is a correctness requirement — and the
+two-tier example above is a case where the two answers differ by a cent.
+
+### 4a.3 A rate is never invented
+
+**Definition.** Where the contract does not state a rate, the engine reports that it cannot price the
+line rather than extrapolating.
+
+**Example.** Usage runs to 1,500 billable units but the ladder stops at 1,000. The line comes back
+`UNRESOLVED` with reason `USAGE_EXCEEDS_TIER_LADDER`, carrying the 1,000 units the ladder did cover and
+the quantity found. No amount is attached.
+
+**Why.** Extrapolating the last tier's rate, or charging the excess at zero, would both produce a
+confident number that no contract agreed to. In a dispute that number is worse than no number, because it
+looks like an answer.
+
+### 4a.4 A discrepancy is a result, not a diagnosis
+
+**Definition.** The engine reports what the contract supports beside what the invoice charged, and stops
+there.
+
+**Example.** Recalculated $21.86 against recorded $28.40, difference −$6.54. That is the entire output. It
+does not claim the cause. Whether that is a duplicated usage event, a wrong tier boundary or a stale
+contract version is the investigation's job.
+
+**Why.** An amount that arrives with a cause attached is harder to challenge: a reviewer must disprove the
+diagnosis before they can trust the arithmetic. Keeping them apart lets the arithmetic stand on its own
+while the diagnosis is argued separately. It is also why `ACCEPTED_AS_RECORDED` and `UNRESOLVED` are
+distinct statuses — a flat fee that cannot be verified is not the same finding as a usage line with no
+contract term, and collapsing them would let a partially verified invoice read as a clean one.
+
+### 4a.5 The balance is a separate question from the arithmetic
+
+**Definition.** `reconcile_balance()` lives in its own module and computes
+`recalculated total − allocated payments − net adjustments`. It uses the recalculated total, never the
+invoice's stated total.
+
+**Example.** A $120.00 invoice recalculates to $120.00, a $50.00 payment is allocated to it, and a $10.00
+credit is issued. Outstanding: $60.00. The same $50.00 payment with *no recorded allocation* leaves the
+full $120.00 outstanding — the money exists, but nobody has said which invoice it pays, and §6.3 lists
+`UNAPPLIED_PAYMENT` as a cause of dispute precisely for that state.
+
+**Why.** A balance depends on events that happened *after* the invoice — a late payment, a goodwill credit,
+a write-off — so merging it with the recalculation would make the arithmetic impossible to verify without
+also asserting something about account state. Using the stated total would be worse: the two would agree by
+construction and the exercise would be pointless. Two refusals matter most here. An overpayment is
+reported as a negative balance rather than clamped to zero, because the negative figure *is* the finding
+that a refund is due. And a balance built on a partial recalculation is marked provisional, so a small
+number cannot read as a verified zero.
 
 ---
 

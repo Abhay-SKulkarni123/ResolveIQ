@@ -28,7 +28,7 @@ and passed. See `AGENT_USAGE.md` for the verification log.
 | PST-01 | Accept a customer complaint about an invoice containing unexpected usage charges | BRIEF | Not started | `SYSTEM_DESIGN.md` §3 | — | — |
 | PST-02 | Investigate using invoice line items, contract/pricing rules, usage events, payment history | BRIEF | Not started | §3, §5 | — | — |
 | PST-03 | Take the customer's dispute description into account as evidence | BRIEF | Not started | §5.1 | — | — |
-| PST-04 | Calculate monetary amounts deterministically | BRIEF | Not started | §6 | — | — |
+| PST-04 | Calculate monetary amounts deterministically | BRIEF | **Implemented + tested** | §6, §6.2, §6.4 | `tests/unit/test_pricing_{rounding,rules,usage,engine,reconciliation}.py` + `test_domain_billing.py` + `test_no_float_in_calculations.py` (221 tests) | `app/pricing/`, `app/domain/billing.py` |
 | PST-05 | Use an LLM to interpret supplied evidence | BRIEF | Not started | §7 | — | — |
 | PST-06 | Cite evidence for every finding | BRIEF | Not started | §5.3, §8.1 | — | — |
 | PST-07 | Present possible causes and resolution options | BRIEF | Not started | §8 | — | — |
@@ -40,8 +40,8 @@ These are quoted from the brief and are treated as acceptance criteria for the w
 
 | ID | Requirement (brief wording) | Provenance | Status | Design reference | Enforcement mechanism | Test reference | Code |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| NEP-01 | Monetary calculations must use Python `Decimal` or equivalent exact decimal arithmetic, never binary floating-point | BRIEF | In progress (foundation value object only) | §6.1, §6.2 | `domain/money.py` rejects `float`; DB `NUMERIC`; API accepts `str`/`int`/`Decimal` | `tests/unit/test_money.py` | `app/domain/money.py` |
-| NEP-02 | Keep financial calculations separate from AI-generated interpretations | BRIEF | Not started | §6, §7 | LLM response schema has **no money fields** (structural, not stylistic); `ImpactCalculator` is pure | — | — |
+| NEP-01 | Monetary calculations must use Python `Decimal` or equivalent exact decimal arithmetic, never binary floating-point | BRIEF | **Implemented + tested** (value object + full calculation path; API boundary still to build) | §6.1, §6.2 | `domain/money.py` and `domain/billing.py` reject `float`; DB `NUMERIC`; AST check rejects float literals, `float()`, `round()` and int/int division across `domain/` and `pricing/` | `tests/unit/test_money.py`, `test_domain_billing.py`, `test_no_float_in_calculations.py` | `app/domain/money.py`, `app/domain/billing.py`, `app/pricing/*` |
+| NEP-02 | Keep financial calculations separate from AI-generated interpretations | BRIEF | In progress (separation enforced; no AI code exists yet, so nothing yet depends on it) | §6, §7 | `app/pricing/` imports only `app/domain/`; the whole calculation path is pure and takes no LLM input. The stronger half of the claim — LLM response schema has **no money fields** — cannot be shown until that schema exists | `tests/unit/test_layer_boundaries.py`, `test_no_float_in_calculations.py` | `app/pricing/*` |
 | NEP-03 | AI findings must reference supplied evidence; never fabricate evidence identifiers or treat unsupported claims as verified | BRIEF | Not started | §5.3, §7.1 | `EvidenceCitationValidator` allowlists keys against the case bundle; rejects the whole response on violation; unsupported claims land in a separate `unverified_claims` field | — | — |
 | NEP-04 | Human approval is required for mock adjustments | BRIEF | Not started | §8.3, §9.1 | Adjustment creation requires an `APPROVE` review decision; enforced in service + DB FK | — | — |
 | NEP-05 | Prevent duplicate adjustments through transactional and database safeguards, not merely a frontend button disable | BRIEF | Not started | §9.3 | 5 independent layers: idempotency key + unique index, partial unique index on active adjustment per dispute, `SELECT … FOR UPDATE`, optimistic `version` column, state-machine guard | — | — |
@@ -88,7 +88,7 @@ them. Each is a proposal.
 | FR-002 | The evidence bundle stores an immutable snapshot (`JSONB`) plus a content hash of each item | Re-running against live source data would make findings irreproducible | Not started | §5.2 |
 | FR-003 | Every finding stores `supporting_evidence` keys, and unverified statements are stored separately in `unverified_claims` | Makes "supported vs asserted" a data-model distinction, not a prose convention | Not started | §5.3 |
 | FR-004 | Monetary impact is computed from a `hypothesis_code` selected by the LLM, via a deterministic registry of calculators | Enforces NEP-02 structurally: the model chooses *which* rule applies, never *how much* | Not started | §6.3 |
-| FR-005 | Every computed amount carries a `calculation_trace` (ordered, human-readable steps with inputs) | An analyst must be able to audit why a number is what it is | Not started | §6.4 |
+| FR-005 | Every computed amount carries a `calculation_trace` (ordered, human-readable steps with inputs) | An analyst must be able to audit why a number is what it is | **Implemented + tested** — trace on every resolved line, `rule_ref` naming the contract term; §6.4 worked example reproduced in a test | §6.4 |
 | FR-006 | Resolution options are proposed by the system; a reviewer selects exactly one, or none | Prevents the LLM from auto-selecting a remedy | Not started | §8 |
 | FR-007 | `POST /api/v1/adjustments` requires an `Idempotency-Key` header | Client-initiated retries must not create a second adjustment | Not started | §9.3 |
 | FR-008 | Reviewer decisions record the `evidence_fingerprint` they were looking at | If evidence changes after approval, the approval is void | Not started | §9.2 |
@@ -96,7 +96,7 @@ them. Each is a proposal.
 | FR-010 | An adjustment may not exceed the invoice balance outstanding at approval time | Prevents over-crediting; needs policy confirmation | Not started | §9.1, §10 (F12) |
 | FR-011 | Investigation stages are individually recorded so a failed run can resume from the first failed stage | Serves "recoverable partial failures" in NEP-07 | Not started | §3.5, §10 (F10) |
 | FR-012 | A degraded (partially failed) investigation is surfaced as degraded in the API and UI, never as complete | Silent partial results are worse than an explicit failure | Not started | §3.5 |
-| FR-013 | All monetary columns are `NUMERIC(19,4)`; quantisation to currency minor units happens at presentation/settlement | Keeps precision decisions explicit and reversible | Not started | §6.1 |
+| FR-013 | All monetary columns are `NUMERIC(19,4)`; quantisation to currency minor units happens at presentation/settlement | Keeps precision decisions explicit and reversible | In progress (storage done and migration-tested; quantisation implemented as `pricing/rounding.py`, presentation not built) | §6.1, §6.2 |
 | FR-014 | Audit history is append-only; no `UPDATE`/`DELETE` grants on `audit_events` for the application role | "Persist audit history" is meaningless if it is mutable | Not started | §11.2, §13 (INV-10) |
 | FR-015 | Seed script loads a deterministic fictional Northstar Cloud dataset with at least one known-bad invoice | The assessment needs a reproducible scenario, and tests need known answers | Not started | §15 |
 | FR-016 | Prompt text and prompt version are recorded on every investigation | Makes LLM output reproducible/attributable when behaviour changes | Not started | §7.2 |
@@ -123,7 +123,7 @@ These are tracked in full in `docs/ENGINEERING_DECISIONS.md` §"Open questions".
 | --- | --- | --- | --- |
 | OQ-01 | Where does analyst/reviewer identity come from (SSO, internal auth, or mock)? | FR-006, NEP-04, STK-01 | Dev-mode header identity with two roles. **Explicitly demo-grade, not real auth.** |
 | OQ-02 | Should adjustments be pre-tax or post-tax? | FR-010 | Adjustment applies to the invoice's pre-tax line subtotal; tax is not recomputed. |
-| OQ-03 | Rounding mode: `ROUND_HALF_UP` (commercial) or `ROUND_HALF_EVEN` (banker's, IEEE)? | NFR-001 | `ROUND_HALF_UP` at invoice boundaries; documented as a single policy constant. |
+| OQ-03 | Rounding mode: `ROUND_HALF_UP` (commercial) or `ROUND_HALF_EVEN` (banker's, IEEE)? | NFR-001 | `ROUND_HALF_UP` at invoice and line boundaries, `ROUND_HALF_EVEN` for residual allocation. **Implemented** in `pricing/rounding.py` as pinned constants and pinned by tests; still a business confirmation, since a different answer is a one-constant change plus its tests. |
 | OQ-04 | Multi-currency and FX: in scope for v1? | FR-013 | Single currency per account; no FX; cross-currency adjustments rejected. |
 | OQ-05 | May resolution options be non-monetary (e.g. "explain the charge", "correct contract metadata")? | FR-006 | Yes — `NO_ADJUSTMENT` and `REQUEST_INFO` exist alongside credit options. |
 | OQ-06 | Retention/PII policy for dispute descriptions and snapshots? | NEP-006, NFR-006 | Retain indefinitely in dev; no PII/PCI stored beyond payment `last4`. |
@@ -154,11 +154,11 @@ assumptions and are labelled as such in the code that implements them.
 
 | Group | Total | Implemented + tested | Not started |
 | --- | --- | --- | --- |
-| Product story (PST) | 8 | 0 | 8 |
-| Non-negotiable principles (NEP) | 10 | 0 | 8 (2 partial) |
+| Product story (PST) | 8 | 1 | 7 |
+| Non-negotiable principles (NEP) | 10 | 1 | 7 (2 partial) |
 | Stack (STK) | 6 | 1 | 2 (3 partial) |
 | Documentation (DOC) | 8 | 8 | 0 |
-| Derived functional (FR) | 16 | 0 | 16 |
+| Derived functional (FR) | 16 | 1 | 13 (2 partial) |
 | Derived non-functional (NFR) | 7 | 0 | 4 (3 partial) |
 
 STK-03 (SQLAlchemy 2.0 + Alembic) moved to implemented in Phase 1 Slice 1: three tables, a reversible
@@ -166,8 +166,15 @@ migration, and 62 integration tests asserting the schema. Those tests are writte
 executed against a live server yet** — the database role did not exist when the code was written. See
 `AGENT_USAGE.md` §9.
 
-**Honest read:** this is a foundation. The two partially-covered principles (NEP-01, NEP-09) have
-foundations in place and unit tests for the money value object, but the billing domain itself does not
-exist yet. Nothing here should be read as "feature complete". In particular, a schema that has been
-declared and unit-tested is not the same as a schema that has been accepted by PostgreSQL, and this
-repository does not yet claim the latter.
+**Honest read:** two slices are genuinely done — the database foundation and the deterministic billing
+engine (ADR-022) — and everything between the evidence bundle and the model is not built. `app/api/`
+exposes only the health endpoint; there is no LLM code, no evidence pipeline, and no review or
+adjustment service.
+
+Two claims are deliberately *not* upgraded. The 62 database integration tests are written and have
+**still never executed against a live PostgreSQL server** in this checkout (no database is reachable),
+so STK-03 remains unverified against the real engine. And NEP-02's stronger half — that the LLM response
+schema contains no money fields — cannot be demonstrated at all until that schema exists; today it is
+vacuously true because there is no LLM output to inspect. A schema that has been declared and
+unit-tested is not the same as a schema PostgreSQL has accepted, and this repository does not claim the
+latter.
