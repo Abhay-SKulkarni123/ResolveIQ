@@ -41,13 +41,13 @@ These are quoted from the brief and are treated as acceptance criteria for the w
 | ID | Requirement (brief wording) | Provenance | Status | Design reference | Enforcement mechanism | Test reference | Code |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | NEP-01 | Monetary calculations must use Python `Decimal` or equivalent exact decimal arithmetic, never binary floating-point | BRIEF | **Implemented + tested** (value object + full calculation path; API boundary still to build) | §6.1, §6.2 | `domain/money.py` and `domain/billing.py` reject `float`; DB `NUMERIC`; AST check rejects float literals, `float()`, `round()` and int/int division across `domain/` and `pricing/` | `tests/unit/test_money.py`, `test_domain_billing.py`, `test_no_float_in_calculations.py` | `app/domain/money.py`, `app/domain/billing.py`, `app/pricing/*` |
-| NEP-02 | Keep financial calculations separate from AI-generated interpretations | BRIEF | In progress (separation enforced; no AI code exists yet, so nothing yet depends on it) | §6, §7 | `app/pricing/` imports only `app/domain/`; the whole calculation path is pure and takes no LLM input. The stronger half of the claim — LLM response schema has **no money fields** — cannot be shown until that schema exists | `tests/unit/test_layer_boundaries.py`, `test_no_float_in_calculations.py` | `app/pricing/*` |
-| NEP-03 | AI findings must reference supplied evidence; never fabricate evidence identifiers or treat unsupported claims as verified | BRIEF | Not started | §5.3, §7.1 | `EvidenceCitationValidator` allowlists keys against the case bundle; rejects the whole response on violation; unsupported claims land in a separate `unverified_claims` field | — | — |
+| NEP-02 | Keep financial calculations separate from AI-generated interpretations | BRIEF | **Implemented + tested** — `app/pricing/` and `app/domain/` are pure and take no LLM input; the response schema has no money field, asserted by walking the generated JSON schema; contract test re-asserts it on a live provider response | §6, §7 | `app/pricing/` imports only `app/domain/`; the whole calculation path is pure and takes no LLM input. The stronger half of the claim — the response schema has **no money fields** — is asserted by walking the generated JSON schema for monetary property names, and re-asserted by the contract suite against a provider's actual output | `tests/unit/test_layer_boundaries.py`, `test_no_float_in_calculations.py` | `app/pricing/*` |
+| NEP-03 | AI findings must reference supplied evidence; never fabricate evidence identifiers or treat unsupported claims as verified | BRIEF | **Implemented + tested** — `services/citations.py` allowlists every cited key against the bundle and rejects the whole response, reporting all violations; unverified claims are a separate schema field, never findings | §5.3, §7.1 | `EvidenceCitationValidator` allowlists keys against the case bundle; rejects the whole response on violation; unsupported claims land in a separate `unverified_claims` field | — | — |
 | NEP-04 | Human approval is required for mock adjustments | BRIEF | Not started | §8.3, §9.1 | Adjustment creation requires an `APPROVE` review decision; enforced in service + DB FK | — | — |
 | NEP-05 | Prevent duplicate adjustments through transactional and database safeguards, not merely a frontend button disable | BRIEF | Not started | §9.3 | 5 independent layers: idempotency key + unique index, partial unique index on active adjustment per dispute, `SELECT … FOR UPDATE`, optimistic `version` column, state-machine guard | — | — |
 | NEP-06 | Persist disputes, findings, evidence references, reviewer decisions, adjustments, and audit history | BRIEF | Not started | §3 | SQLAlchemy models + Alembic migrations; `audit_events` append-only | — | — |
 | NEP-07 | Support additional evidence, case reopening, stale investigation detection, and recoverable partial failures | BRIEF | Not started | §5.2, §9.2, §10 | `evidence_items` append-only bundle; `POST /reopen`; `evidence_fingerprint` + `expires_at`; per-stage status with `resume_from` | — | — |
-| NEP-08 | Validate inputs and structured LLM outputs | BRIEF | Not started | §5.3, §7.3 | Pydantic v2 strict models at every boundary; `extra="forbid"`; structured output / JSON-schema-constrained decoding; retry-then-degrade | — | — |
+| NEP-08 | Validate inputs and structured LLM outputs | BRIEF | **In progress** — `ports/interpretation.py` validates with Pydantic v2, `extra="forbid"`, frozen models; a format error becomes `PARTIAL_FAILED`. Retry is *not* implemented (ADR-026), so this is partial against NEP-08 | §5.3, §7.3 | Pydantic v2 strict models at every boundary; `extra="forbid"`; structured output / JSON-schema-constrained decoding; retry-then-degrade | — | — |
 | NEP-09 | Never commit credentials or expose secrets in frontend code | BRIEF | In progress (`.env.example` only, no real secrets) | §11.2 | Backend-only env; `.gitignore`; frontend receives `/api/v1/capabilities` which never contains key material; CI secret scan | — | `.env.example`, `.gitignore` |
 | NEP-10 | Keep the architecture simple; introduce abstractions only when they improve testability, reliability, or maintainability | BRIEF | Not started | `SOLID.md` | Every interface in `app/ports/` must name the concrete problem it solves; documented in `SOLID.md` §"Abstraction ledger" | — | — |
 
@@ -87,15 +87,15 @@ them. Each is a proposal.
 | FR-001 | An investigation is a versioned, re-runnable analysis over an immutable evidence bundle | Findings must be attributable to the exact evidence reviewed | Not started | §3.5, §5.2 |
 | FR-002 | The evidence bundle stores an immutable snapshot (`JSONB`) plus a content hash of each item | Re-running against live source data would make findings irreproducible | Not started | §5.2 |
 | FR-003 | Every finding stores `supporting_evidence` keys, and unverified statements are stored separately in `unverified_claims` | Makes "supported vs asserted" a data-model distinction, not a prose convention | Not started | §5.3 |
-| FR-004 | Monetary impact is computed from a `hypothesis_code` selected by the LLM, via a deterministic registry of calculators | Enforces NEP-02 structurally: the model chooses *which* rule applies, never *how much* | Not started | §6.3 |
+| FR-004 | Monetary impact is computed from a `hypothesis_code` selected by the LLM, via a deterministic registry of calculators | Enforces NEP-02 structurally: the model chooses *which* rule applies, never *how much* | **Implemented + tested** — all 9 codes in `pricing/impact.py`, each dispatching to a Phase 2 result; `test_the_registry_has_no_calculator_without_a_code` fails if a code has none | §6.3 |
 | FR-005 | Every computed amount carries a `calculation_trace` (ordered, human-readable steps with inputs) | An analyst must be able to audit why a number is what it is | **Implemented + tested** — trace on every resolved line, `rule_ref` naming the contract term; §6.4 worked example reproduced in a test | §6.4 |
-| FR-006 | Resolution options are proposed by the system; a reviewer selects exactly one, or none | Prevents the LLM from auto-selecting a remedy | Not started | §8 |
+| FR-006 | Resolution options are proposed by the system; a reviewer selects exactly one, or none | Prevents the LLM from auto-selecting a remedy | **In progress** — closed `ResolutionType` enum in `domain/hypotheses.py`; every money-moving option is forced to `requires_human_approval=True`. Reviewer selection and persistence are not built | §8 |
 | FR-007 | `POST /api/v1/adjustments` requires an `Idempotency-Key` header | Client-initiated retries must not create a second adjustment | Not started | §9.3 |
 | FR-008 | Reviewer decisions record the `evidence_fingerprint` they were looking at | If evidence changes after approval, the approval is void | Not started | §9.2 |
 | FR-009 | Approving an adjustment whose investigation is stale returns `409 INVESTIGATION_STALE` | Directly serves NEP-07 | Not started | §9.1, §10 (F5/F6) |
 | FR-010 | An adjustment may not exceed the invoice balance outstanding at approval time | Prevents over-crediting; needs policy confirmation | Not started | §9.1, §10 (F12) |
-| FR-011 | Investigation stages are individually recorded so a failed run can resume from the first failed stage | Serves "recoverable partial failures" in NEP-07 | Not started | §3.5, §10 (F10) |
-| FR-012 | A degraded (partially failed) investigation is surfaced as degraded in the API and UI, never as complete | Silent partial results are worse than an explicit failure | Not started | §3.5 |
+| FR-011 | Investigation stages are individually recorded so a failed run can resume from the first failed stage | Serves "recoverable partial failures" in NEP-07 | **Not started** — the per-stage *status vocabulary* exists (`domain/investigation.py`) and an unavailable model maps to `DEGRADED`, but nothing is recorded or resumed; that needs persistence | §3.5, §10 (F10) |
+| FR-012 | A degraded (partially failed) investigation is surfaced as degraded in the API and UI, never as complete | Silent partial results are worse than an explicit failure | **Implemented + tested (in memory)** — `InvestigationResult.__post_init__` refuses `COMPLETE` without a validated interpretation and refuses any non-`COMPLETE` status with an empty degradation list; failure-to-outcome mapping is asserted. Surfacing it in an API and UI is not built | §3.5 |
 | FR-013 | All monetary columns are `NUMERIC(19,4)`; quantisation to currency minor units happens at presentation/settlement | Keeps precision decisions explicit and reversible | In progress (storage done and migration-tested; quantisation implemented as `pricing/rounding.py`, presentation not built) | §6.1, §6.2 |
 | FR-014 | Audit history is append-only; no `UPDATE`/`DELETE` grants on `audit_events` for the application role | "Persist audit history" is meaningless if it is mutable | Not started | §11.2, §13 (INV-10) |
 | FR-015 | Seed script loads a deterministic fictional Northstar Cloud dataset with at least one known-bad invoice | The assessment needs a reproducible scenario, and tests need known answers | Not started | §15 |
@@ -108,7 +108,7 @@ them. Each is a proposal.
 | NFR-001 | Monetary arithmetic must be reproducible across runs and platforms | Decimal semantics must be pinned, not inherited from the platform | In progress (rounding mode pinned, `Money` value object) | §6.2 |
 | NFR-002 | No floating-point arithmetic anywhere in the monetary path | Direct consequence of NEP-01; enforced by test + grep-able check | In progress |
 | NFR-003 | LLM provider is swappable without changing domain or service code | Required by STK-06 | Not started |
-| NFR-004 | Tests must not require network access or a running LLM | Deterministic mock provider is the default in tests | Not started |
+| NFR-004 | Tests must not require network access or a running LLM | Deterministic mock provider is the default in tests | **Implemented + tested** — 32 contract tests + 47 investigation tests run entirely offline; `test_the_suite_needs_no_network` asserts no socket is opened |
 | NFR-005 | The system must be runnable locally with one command | STK-05 | In progress (`docker compose up`) |
 | NFR-006 | No secret may appear in a frontend bundle, log line, or API response | NEP-009 | In progress |
 | NFR-007 | Untrusted customer text is treated as data, never as instructions | Prompt-injection defence | Not started |
@@ -166,15 +166,18 @@ migration, and 62 integration tests asserting the schema. Those tests are writte
 executed against a live server yet** — the database role did not exist when the code was written. See
 `AGENT_USAGE.md` §9.
 
-**Honest read:** two slices are genuinely done — the database foundation and the deterministic billing
-engine (ADR-022) — and everything between the evidence bundle and the model is not built. `app/api/`
-exposes only the health endpoint; there is no LLM code, no evidence pipeline, and no review or
-adjustment service.
+**Honest read:** three slices are genuinely done — the database foundation, the deterministic billing
+engine (ADR-022), and the AI interpretation workflow (evidence model, strict response schema, citation
+validator, impact registry, `InvestigationService`). `app/api/` still exposes only the health endpoint,
+the workflow has no persistence and no real provider behind it, and there is no review or adjustment
+service.
 
 Two claims are deliberately *not* upgraded. The 62 database integration tests are written and have
 **still never executed against a live PostgreSQL server** in this checkout (no database is reachable),
-so STK-03 remains unverified against the real engine. And NEP-02's stronger half — that the LLM response
-schema contains no money fields — cannot be demonstrated at all until that schema exists; today it is
-vacuously true because there is no LLM output to inspect. A schema that has been declared and
-unit-tested is not the same as a schema PostgreSQL has accepted, and this repository does not claim the
-latter.
+so STK-03 remains unverified against the real engine. And NEP-02's stronger half — that the response
+schema contains no money fields — is now demonstrated rather than vacuous, but only against
+`MockLlmProvider`: it is a structural property of the schema, so it holds for any conforming provider,
+yet no hosted model has been called, so nothing about a real model's adherence is verified. Both
+distinctions are load-bearing. A schema that has been declared and unit-tested is not the same as a
+schema PostgreSQL has accepted; and a schema that rejects a monetary field is not the same as a
+demonstrated model obeying it.

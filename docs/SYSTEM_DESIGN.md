@@ -299,15 +299,15 @@ must never be presented as a clean one.
 │   │   ├── main.py                  # FastAPI factory
 │   │   ├── config.py                # pydantic-settings, reads env
 │   │   ├── api/                     # routers/, schemas/, deps.py, errors.py
-│   │   ├── domain/                  # entities.py, money.py, state_machines.py, evidence.py
-│   │   ├── pricing/                 # engine.py, rules.py, results.py, reconciliation.py, trace.py, usage.py, rounding.py
-│   │   ├── services/                # dispute.py, investigation.py, review.py, adjustment.py, audit.py
-│   │   ├── ports/                   # llm.py, repositories.py
+│   │   ├── domain/                  # money.py, billing.py, evidence.py, hypotheses.py, investigation.py
+│   │   ├── pricing/                 # engine.py, rules.py, results.py, reconciliation.py, trace.py, usage.py, rounding.py, impact.py
+│   │   ├── services/                # investigation.py, citations.py, evidence_collection.py, (dispute/review/adjustment/audit later)
+│   │   ├── ports/                   # llm.py, interpretation.py, (repositories.py later)
 │   │   └── adapters/
 │   │       ├── persistence/         # SQLAlchemy models, repos, unit_of_work
 │   │       └── llm/                 # mock.py, (real.py later)
 │   └── tests/
-│       ├── unit/                    # pure: money, pricing, state machines, validators
+│       ├── unit/                    # pure: money, pricing, evidence, schema, citations, impact, investigation
 │       ├── integration/             # DB-backed, real Postgres via Compose
 │       ├── contract/                # LlmProvider conformance, run against every provider
 │       └── fixtures/                # builders for accounts, invoices, disputes
@@ -728,8 +728,8 @@ Machine-checkable where possible. Each maps to a test in Phase 1+.
 | ID | Invariant | Enforcement |
 | --- | --- | --- |
 | INV-01 | No monetary value is ever a `float`. | `Money` rejects `float`; DB `NUMERIC`; AST check (`tests/unit/test_no_float_in_calculations.py`) over `domain/` and `pricing/` — implemented |
-| INV-02 | No LLM output field carries a monetary amount. | Schema has no such field; contract test asserts |
-| INV-03 | Every finding cites ≥1 evidence key, all of which exist in the bundle. | `EvidenceCitationValidator` + DB check |
+| INV-02 | No LLM output field carries a monetary amount. | Schema has no such field; `test_interpretation_schema.py` walks the generated JSON schema for monetary field names; contract test re-asserts it on a live response — **implemented** |
+| INV-03 | Every finding cites ≥1 evidence key, all of which exist in the bundle. | `min_length=1` on the schema, then `services/citations.py` rejects the whole response on any unknown key — **implemented** (DB check not applicable yet: findings are not persisted) |
 | INV-04 | Sum of `invoice_line_items.amount` is recorded and compared to `invoice.stated_total`; mismatch is a finding, not an exception. | `RecordedInvoice.line_total` kept distinct from `stated_total`; domain refuses a total with no lines — implemented |
 | INV-05 | `sum(payment_allocations.amount) <= payments.amount` per payment. | `Payment.__post_init__`, per-invoice `PaymentAllocation` — implemented |
 | INV-06 | At most one adjustment in `PENDING`/`APPLIED` per dispute. | Partial unique index |
@@ -738,7 +738,7 @@ Machine-checkable where possible. Each maps to a test in Phase 1+.
 | INV-09 | Adjustment currency == invoice currency. | `Money` cross-currency guard |
 | INV-10 | `audit_events` is append-only. | No UPDATE/DELETE grant for app role |
 | INV-11 | Investigations are immutable once `COMPLETE`; re-analysis creates a new version. | Service guard |
-| INV-12 | `computed_impact` is only ever written by `ImpactCalculator`. | Private constructor / module boundary + review |
+| INV-12 | `computed_impact` is only ever written by the impact registry. | `pricing/impact.py` reads Phase 2 results and computes no money of its own; the LLM supplies a code and nothing else — **implemented** (ADR-023) |
 | INV-13 | Money is quantised to currency minor units only at presentation/settlement. | `Money.quantise()` call-site review + tests |
 
 ---

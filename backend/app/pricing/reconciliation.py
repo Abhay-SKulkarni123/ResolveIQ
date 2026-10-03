@@ -37,7 +37,32 @@ from app.domain.billing import Adjustment, Payment
 from app.domain.money import CurrencyMismatchError, Money
 from app.pricing.results import InvoiceRecalculation
 
-__all__ = ["OutstandingBalance", "reconcile_balance"]
+__all__ = [
+    "OutstandingBalance",
+    "reconcile_balance",
+    "unallocated_payment_total",
+]
+
+
+def unallocated_payment_total(payments: list[Payment], currency: str) -> Money:
+    """Money received with no allocations recorded at all.
+
+    The complement of :attr:`OutstandingBalance.unapplied_payment_total`, and a distinct
+    condition from it. ``_unapplied_payments`` counts money that was allocated to some
+    *other* invoice; this counts money nobody allocated anywhere. The investigation needs
+    both, because they call for different follow-up — one is a misdirection, the other is
+    an unapplied remittance — and a report that conflated them would send an analyst to
+    the wrong record.
+
+    Public so the ``UNAPPLIED_PAYMENT`` impact calculator can report the figure without
+    re-summing the payments itself. The arithmetic stays here, next to the other balance
+    arithmetic, so there is one place where it can be wrong.
+    """
+    total = Money.zero(currency)
+    for payment in payments:
+        if not payment.allocations:
+            total = total + payment.amount
+    return total
 
 
 @dataclass(frozen=True)

@@ -30,6 +30,10 @@ Nothing here is a decision I did not actually make. Where the brief was silent, 
 | ADR-020 | The database checks the *shape* of money; the domain checks its *meaning* | Accepted |
 | ADR-021 | Least-privilege database role for development and tests | Accepted |
 | ADR-022 | Recalculation as pure functions over value objects; no invoice tables yet | Accepted |
+| ADR-023 | The impact registry dispatches to the Phase 2 engine and computes nothing | Accepted |
+| ADR-024 | `COMPLETE` is refused when the interpretation is missing or caveated | Accepted |
+| ADR-025 | Confidence and likelihood cross the wire as strings, not JSON numbers | Accepted |
+| ADR-026 | No retries in the provider port; `llm_max_retries` deliberately unread | Accepted |
 | OQ-01…OQ-10 | Open questions | Open |
 
 ---
@@ -738,6 +742,136 @@ Alongside that:
   boundary check was added, and would silently stop applying to a renamed file.
 
 ---
+
+---
+
+## ADR-023 — The impact registry dispatches to the Phase 2 engine and computes nothing
+
+**Status.** Accepted
+
+**Context.** ADR-004 commits to the model selecting a `hypothesis_code` and a registry computing the
+money. Phase 2 then built `app/pricing/` with tier, per-unit and commitment calculators, usage
+deduplication, period filtering and balance reconciliation. §6.3 lists nine hypothesis codes, and
+several of them describe things the engine already detects: `DUPLICATED_USAGE` is a `dedupe_key`
+collision, `OUT_OF_PERIOD_USAGE` is a period filter, `UNAPPLIED_PAYMENT` is a reconciliation
+question.
+
+The obvious way to build the registry is to give each code its own calculator. That would put eight
+or nine implementations of overlapping arithmetic in the repository, at least one of which would
+disagree with Phase 2 about rounding or about which units count. In a dispute, "which of the two
+calculators is right" is not a question anyone can answer under pressure.
+
+**Decision.** `app/pricing/impact.py` maps each code to an assessor that reads what Phase 2 already
+computed and reports it. It contains no pricing arithmetic of its own. Concretely:
+
+- `OVERAGE_TIER_MISMATCH`, `UNIT_PRICE_MISMATCH` → the engine's `LineRecalculation.difference`, with
+  its trace attached.
+- `DUPLICATED_USAGE`, `OUT_OF_PERIOD_USAGE` → the same line difference, gated on
+  `UsageSummary.duplicates` / `.out_of_period` actually being non-empty, with the anomaly counted in
+  the basis string.
+- `INCORRECT_ALLOCATION` → `OutstandingBalance.outstanding`.
+- `STATEMENT_TOTAL_MISMATCH` → `stated_total - line_total`, read from the invoice, because this code is
+  about the invoice disagreeing with itself rather than about whether the charge was right.
+- `COMMITMENT_SHORTFALL` → the whole-invoice difference, refused while any metric is unresolved,
+  because a minimum commitment applies to the invoice as a whole and a partial total cannot settle
+  it.
+- `UNEXPLAINED` → no impact, ever.
+
+An assessor that cannot answer returns `impact=None` **with a reason**, never an estimate and never a
+silent `None`. "No impact" and "not applicable" are different answers to a reviewer.
+
+**Consequences.** Adding a hypothesis code requires a calculator, and `test_the_registry_covers_the_
+closed_vocabulary` fails until one exists, so a code cannot ship silently unpriced. The trade-off is
+that the registry is not extensible at runtime — there is no plugin mechanism — which is correct: an
+impact calculator is arithmetic, and arithmetic belongs under test in one layer.
+
+One genuine addition to Phase 2 was needed. §6.3's `UNAPPLIED_PAYMENT` reads `payments −
+payment_allocations`, but Phase 2's `unapplied_payment_total` counts only money *allocated to another
+invoice*. Money with no allocation at all — the more common case — was not visible to the
+investigation. `unallocated_payment_total()` was added to `app/pricing/reconciliation.py` rather than
+summed inside the assessor, so the arithmetic stays beside the other balance arithmetic and there is
+one place for it to be wrong. The two conditions remain distinct in the output, because they need
+different follow-up.
+
+## ADR-024 — `COMPLETE` is refused when the interpretation is missing or caveated
+
+**Status.** Accepted
+
+**Context.** ADR-008 and FR-012 require that a degraded investigation is never presented as a clean
+one. The natural way to satisfy that is discipline: return a status and trust every caller to check
+it. That is exactly the assumption FR-012 exists to distrust, and it fails quietly — a status field
+that is correct and a caller that does not read it.
+
+The related risk is the inverse one. A provider can fail in a way that is indistinguishable from
+success: returning a response with no findings means "the model failed" and "the invoice is clean"
+produce the same object. §10 (F10) calls for a repair retry; this phase has no retry (ADR-026
+below), so the failure has to be representable without one.
+
+**Decision.** Two structural refusals in `InvestigationResult.__post_init__`, plus a fixed mapping from
+failure to outcome:
+
+- `status=COMPLETE` **requires** a validated interpretation and an empty degradation list.
+- Any non-`COMPLETE` status **requires** a non-empty degradation list, so an unexplained degraded
+  result cannot be constructed at all.
+
+Failure outcomes, stated as data in `_FAILURE_OUTCOMES` and asserted by tests rather than inferred
+from a chain of `except` clauses:
+
+| Failure | Status | Why |
+| --- | --- | --- |
+| Not configured, timed out, provider error | `DEGRADED` | The model was unavailable; the deterministic findings stand alone |
+| Response could not be parsed | `PARTIAL_FAILED` | A stage lost its output |
+| Citation rejected | `PARTIAL_FAILED` | A stage lost its output |
+
+The ordering of that table is load-bearing and is pinned by
+`test_a_format_error_is_not_reported_as_an_unavailable_model`: `LlmResponseFormatError` subclasses
+`LlmProviderError`, so a base-class-first mapping would report a lost stage as a missing model and
+understate the failure.
+
+**Consequences.** `investigate()` does not raise for a model-side failure; it returns the arithmetic
+plus the failure, because the arithmetic is still worth having and the failure is part of the answer.
+Programming errors and structural data errors still propagate — those are defects, not outcomes.
+
+## ADR-025 — Confidence and likelihood cross the wire as strings, not JSON numbers
+
+**Status.** Accepted
+
+**Context.** §8.1 specifies `confidence` as a `Decimal` from 0 to 1. It is not money, so INV-01 does
+not reach it. The same inexactness nevertheless applies: a provider emitting `"confidence": 0.82` in
+JSON produces a Python `float`, and `Decimal(0.82)` recovers the nearest binary approximation to
+`0.82` rather than `0.82`. ADR-001's reasoning — that conversion launders the error instead of
+revealing it — is about the boundary, not about the amount.
+
+**Decision.** `confidence` and `likelihood` are decimal *strings* on the wire and are parsed to
+`Decimal` by `confidence_value()`. A JSON number is refused with a message naming the field, so a
+provider can repair rather than guess. Bounds are enforced twice: by the parser for a clear message,
+and by the field constraint for any other route into the model.
+
+**Consequences.** A real adapter must instruct the model to emit strings, which the shipped
+`system_instructions` do. The cost is a stricter schema than JSON requires, and it is a stricter schema
+than this one needs in order to keep a probability exact.
+
+## ADR-026 — No retries in the provider port
+
+**Status.** Accepted
+
+**Context.** ADR-013 specifies one repair retry for a schema failure, and `llm_max_retries` has been in
+`app/config.py` since the foundation. A retry loop is easy to add and easy to get wrong: it needs a
+justification against a specific failure mode, a bound, and a decision about what it costs.
+
+**Decision.** No retry logic in `app/ports/llm.py`, and `llm_max_retries` is deliberately unread by it.
+Failures are reported, not retried. The port docstring records what a retry would have to justify.
+
+**Consequences.** A single transient network failure ends the interpretation stage as `DEGRADED`, which
+understates a recoverable problem. That is the cheaper error: a retry policy added without evidence
+about which failures are transient would multiply latency and provider cost while hiding the failures
+it could not fix. Recorded here so the omission is visible as a decision rather than an oversight.
+
+**Relationship to ADR-013.** ADR-013 (status: *Proposed — needs review*) specifies one repair retry for
+a schema failure. Its Pydantic `extra="forbid"` validation is implemented; its retry is deliberately
+not, per this ADR. ADR-013's open sub-question about linting narrative text for currency-shaped tokens
+is also still unimplemented, and `test_narrative_prose_may_mention_an_amount_while_setting_no_
+monetary_field` records that limitation rather than papering over it.
 
 ---
 

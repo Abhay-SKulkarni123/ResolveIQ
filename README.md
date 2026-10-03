@@ -34,8 +34,9 @@ Full reasoning: [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) §1, [`docs/ENG
 
 ## ⚠️ Current status — read this first
 
-Two slices are genuinely complete: the database foundation and the deterministic billing engine.
-Everything between the evidence bundle and the model is not built.
+Two slices are genuinely complete: the database foundation and the deterministic billing engine. The
+AI interpretation workflow is now built and verified offline, but it has no HTTP API, no persistence
+and no real model behind it.
 
 | Area | Status |
 | --- | --- |
@@ -45,9 +46,14 @@ Everything between the evidence bundle and the model is not built.
 | Docker Compose file | **Syntax validated; never actually started** (no Docker daemon on this machine) |
 | SQLAlchemy models, Alembic migrations, seed data | **Implemented** — 62 integration tests written, **never executed against a live server** (none reachable) |
 | Pricing engine (rules, traces, recalculation, reconciliation) | **Implemented, verified** — 221 tests, no database required (ADR-022) |
-| Evidence pipeline, LLM adapters | Not built |
-| Investigation / review / adjustment services | Not built |
-| `app/api/` beyond `/health`, `app/services/` | Not built |
+| Evidence model, LLM schema, citation validator | **Implemented, verified** — 83 tests |
+| Impact registry (all 9 hypothesis codes) | **Implemented, verified** — 54 tests; dispatches to the engine, computes no money (ADR-023) |
+| `MockLlmProvider` | **Implemented, verified** — 32 contract tests run against it |
+| Investigation service (end-to-end, in memory) | **Implemented, verified** — 47 tests; no API route, no persistence, no resume |
+| Real LLM provider | **Not built** — port and mock only (OQ-08, ADR-026) |
+| Investigation persistence / state machine resume | Not built — findings are not stored |
+| Review / adjustment services | Not built |
+| `app/api/` beyond `/health` | Not built |
 | Frontend (entirely) | Not built — `frontend/` is an empty directory |
 
 Per-requirement status is tracked in
@@ -171,15 +177,27 @@ SQLAlchemy models (`NUMERIC` money, JSONB snapshots), Alembic migration, determi
 **Acceptance criteria**
 - [x] Every `hypothesis_code` calculator passes golden fixtures with hand-computed values
 - [x] A test asserts `float` never appears in the `pricing/` call path
-- [ ] Schema rejects an unknown field; a money field cannot be expressed in the schema at all
-- [ ] A response citing a non-existent evidence key is **rejected entirely**
+- [x] Schema rejects an unknown field; a money field cannot be expressed in the schema at all
+- [x] A response citing a non-existent evidence key is **rejected entirely**
 - [ ] Killing the process mid-investigation and resuming completes without duplicating rows
 
 The pricing half of this phase is done: `PER_UNIT`, `TIERED` and `COMMITMENT` all produce exact
 amounts, a single rounding at the line boundary, and an ordered `calculation_trace` naming the
-contract term. Recalculating the §6.4 worked example returns 21.86 against a recorded 28.40. The AI
-interpretation half is untouched — there is no LLM code, no evidence pipeline and no investigation
-state machine yet.
+contract term. Recalculating the §6.4 worked example returns 21.86 against a recorded 28.40.
+
+The AI interpretation half is now built as a pure, offline workflow — `app/domain/evidence.py`,
+`app/domain/hypotheses.py`, `app/ports/interpretation.py`, `app/ports/llm.py`,
+`app/services/citations.py`, `app/services/evidence_collection.py`, `app/services/investigation.py`,
+`app/pricing/impact.py` and `app/adapters/llm/mock.py`. `InvestigationService.investigate()` runs the
+deterministic engine, hands the evidence bundle to an `LlmProvider`, validates the response against
+the schema and then against the allowlist, computes the impact from the hypothesis code, and returns a
+fingerprint and provenance.
+
+Three things are deliberately *not* claimed. There is no real provider, so nothing here has been run
+against a hosted model. There is no persistence, so an investigation cannot be resumed after a
+process dies — the last criterion above is unchecked for that reason. And narrative text is not
+screened for currency-shaped tokens: a model can still *say* "the amount was wrong", it simply cannot
+put a figure into the structure where it would reach a calculation.
 
 ### Phase 3 — Review & adjustment (the hard requirements)
 Review decisions, adjustment creation with all five duplicate-prevention layers, staleness, reopening,

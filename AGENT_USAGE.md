@@ -495,3 +495,174 @@ Run `backend/scripts/create_dev_database.sql` as an administrator, put the passw
 the 62 skipped integration tests. That is the smallest step that turns "declared" into "accepted by
 PostgreSQL". After that, `alembic check` in CI is what keeps the models and the migration from drifting,
 and only then is there a base for the repository layer.
+
+---
+
+## 10. Phase 2 — Deterministic billing engine
+
+Pure recalculation over frozen value objects: tiered, per-unit and commitment pricing, usage
+deduplication, period filtering, exact rounding, an ordered `calculation_trace`, and balance
+reconciliation. ADR-022 explains why no invoice tables were added.
+
+### 10.1 The bug that mattered, and where it hid
+
+`recalculate_invoice()` initially treated a line whose quantity exceeded the tier ladder as prunable:
+it clamped the quantity to the top tier and priced the remainder at that tier's rate. Every test passed.
+The reason is that the fixture used for the check had usage that fit inside the ladder, so the
+overrun branch was never executed — the test asserted the code was right about a case the code had
+never been asked about.
+
+It surfaced when I added the §6.4 worked example as a hand-computed fixture (1,500 units against a
+1,000-unit ladder, expected `UNRESOLVED`), which failed:
+
+```
+assert line.status is LineStatus.UNRESOLVED
+  -> got LineStatus.RESOLVED, calculated 1,500 x 0.0007 = 1.05
+```
+
+The lesson is the one I would keep from both phases: **a green suite proves the cases were run, not that
+the rule was understood.** `Money.allocate()` in Phase 0 had the same shape of defect — correct
+arithmetic, wrong unit — and both bugs lived in the branch that only a deliberately-out-of-range fixture
+reaches.
+
+### 10.2 Judgement calls recorded rather than silently taken
+
+| Call | Reasoning |
+| --- | --- |
+| An unresolved line makes the total a **lower bound**, not "no discrepancy" | Such a line may have been wrong in *either* direction, so collapsing it into "fine" would hide a possible overcharge |
+| `ACCEPTED_AS_RECORDED` as a distinct third status | A `FIXED` fee can be confirmed by no usage evidence; marking it verified would be a claim the evidence does not support |
+| `reconcile_balance()` separate from the engine | A balance depends on events *after* the invoice; merging them makes the arithmetic unverifiable |
+| The balance uses the **recalculated** total, never `stated_total` | Using the stated total would make the two agree by construction, i.e. verify nothing |
+| `rounding_mode` column removed from `contract_price_terms` | `SYSTEM_DESIGN.md` §3.2 and §6.2 contradicted each other. Removed the column rather than adding a field that breaks an existing decision, and recorded which document would be wrong if the intent was per-contract rounding |
+| Phase 1's `Settings.is_sqlite` deleted | Dead code implying a supported SQLite path. `create_engine_for_url` now refuses non-PostgreSQL URLs citing ADR-014, instead of building an engine that misbehaves on `JSONB` and `timestamptz` |
+
+### 10.3 Verified
+
+366 passed, 62 skipped; `mypy app` clean over 34 source files under `strict = true`; `ruff check` and
+`ruff format --check` clean. All 366 need no database and no network. **Not verified:** the 62
+integration tests still skip — no reachable PostgreSQL. Committed as `a594326` and pushed.
+
+---
+
+## 11. Phase 3 (first slice) — AI interpretation workflow
+
+Evidence model, strict response schema, citation validator, impact registry, `MockLlmProvider`, and the
+`InvestigationService` that ties them together.
+
+### 11.1 Two ordering mistakes, and the tests that caught them
+
+**I recomputed a value I already had.** `EvidenceItem` computed a canonical SHA-256 of its content and
+then, when a caller supplied an expected hash, compared it *after* overwriting the computed value with
+the supplied one. The comparison was `x == x`, always true, so any fabricated hash passed. Caught by
+`test_it_rejects_a_hash_that_does_not_match_the_content`. Ordering is the whole bug: a check placed
+after the assignment it is meant to verify.
+
+**I caught the wrong exception first.** The failure-to-status mapping ordered `except LlmProviderError`
+before `except LlmResponseFormatError`. Since `LlmResponseFormatError` subclasses `LlmProviderError`, a
+malformed response was reported as `DEGRADED` / "model unavailable" instead of `PARTIAL_FAILED`. The
+reviewer would have been told the vendor was down when the vendor was answering perfectly — an
+understated failure, which is the more dangerous direction. Caught by
+`test_a_format_error_is_not_reported_as_an_unavailable_model`. This became ADR-024: the mapping is a
+table, asserted by test, precisely so that subclass ordering cannot be got wrong quietly a second time.
+
+### 11.2 A third bug, found by distrusting my own docstring
+
+`EvidenceItem` is a `@dataclass(frozen=True)`, and its `snapshot` field was deep-copied at construction.
+I was about to write in `AGENT_USAGE.md` that the evidence model had 29 tests pinning immutability. Then I
+checked whether that was actually true rather than whether it was probably true, and ran this:
+
+```python
+item = EvidenceItem.create("contract:c1", EvidenceType.CONTRACT_TERM, {"rate": "0.0005"})
+item.snapshot["rate"] = "0.9999"
+assert content_hash_of(item.snapshot) == item.content_hash   # -> False
+```
+
+`frozen=True` stops a caller *rebinding* `item.snapshot`. It does nothing to the `dict` inside, so a
+caller could edit a record whose `content_hash` had already been sealed at construction. The stored hash
+then described content the object no longer held. That is not a cosmetic issue: ADR-006 commits to
+immutable evidence snapshots precisely so that a fingerprint can decide whether a reviewer's approval is
+still valid, and FR-008's staleness check is built on that fingerprint. The one object a reviewer is
+supposed to be able to trust was editable.
+
+Fixed by deep-freezing the snapshot at construction — `MappingProxyType` over new dicts, tuples over
+new tuples — with `canonical_json` thawing that form back to plain JSON before hashing, so the serialised
+bytes are unchanged and no existing fingerprint moves. Six regression tests added, including
+`test_freezing_does_not_change_the_hash_bytes`, which pins that freezing cannot alter the hash of equal
+content.
+
+Worth recording as a process point: the bug survived because "frozen dataclass" *reads* as immutable, and
+I wrote a sentence asserting immutability instead of testing it. The claim was false, and the only reason
+I know that is that the sentence I was writing did not match the code I had written.
+
+### 11.3 Two tests I wrote that asserted the wrong thing
+
+The contract suite's no-money assertion searched the whole serialised response for the substring
+`amount`. It failed — against the mock's own narrative, which reads "it asserts no cause". The
+legitimate word "amount" in prose is exactly what a *good* finding says.
+
+The fix was to assert on field **names** rather than text, which is what the requirement actually means.
+I then wrote a second test to document the prose limitation and it contained `assert ... or True`, which
+is an assertion that cannot fail. I deleted it rather than leave a test that looked like coverage, and
+moved the real point — that prose may name an amount while the structure cannot carry one — into
+`test_interpretation_schema.py` as a test that asserts both halves. A test suite that grows to 216 tests
+is exactly when a vacuous one becomes invisible.
+
+The same shape of mistake surfaced a second time, in the opposite direction. The contract test asserting
+that only snapshots cross the provider boundary read:
+
+```python
+assert isinstance(item.snapshot, dict)
+```
+
+That looks like a reasonable "this is plain data, not a domain object" check, but `dict` is the *mutable*
+type. The test was pinning the opposite of ADR-006, and it only ever passed because the snapshot was
+mutable. It failed the moment I fixed 11.2 properly. It now asserts `isinstance(snapshot, Mapping)`, that
+writing to it raises, and that none of `RecordedInvoice`, `PriceTerm`, `UsageEvent` or `Money` appears
+there — which is what the test name was actually about. Two of my three bad tests asserted the wrong
+property while looking correct, and neither would ever have failed for the reason its author intended.
+
+### 11.4 Where I declined to build
+
+| Temptation | Why declined |
+| --- | --- |
+| A real LLM adapter | OQ-08 is unanswered. A speculative vendor adapter is untestable and would need rewriting; the port plus 32 conformance tests is what makes adding one cheap |
+| A retry loop in the provider port | ADR-013 mandates one repair retry and `llm_max_retries` has been in settings since Phase 0. A retry needs a specific failure mode to justify it; without evidence about which failures are transient it multiplies latency and hides what it cannot fix. Recorded as ADR-026 so the omission is a decision, not an oversight |
+| Narrative linting for currency tokens | False-positives on "the $4,200 payment", which a reviewer should read anyway. Left as ADR-013's open sub-question, and a test now records the limitation |
+| A `Repository[T]` base class for the evidence bundle | Would couple the domain to an ORM query API. The bundle is immutable and self-contained; persistence will need a different shape |
+| Wiring an HTTP route | No persistence yet. A route returning an in-memory result would look finished and survive no restart |
+| Persisting findings to the existing tables | Requires a migration; the finding schema was still moving. Guessing columns from a design document is how Phase 0's `alembic` config bug happened |
+
+### 11.5 Verified, and not verified
+
+**Verified** — `590 passed, 65 skipped`, up from `366 passed, 62 skipped` at `a594326`.
+`mypy app` clean (34 files, strict). `ruff check` and `ruff format --check` clean across
+`app/`, `tests/`, `migrations/`, `scripts/`. Nothing in the new suite touches a network or a database;
+`test_the_suite_needs_no_network` asserts the former.
+
+The delta is worth reading closely: `590 − 366 = 224`, and the six new test files account for 216. The
+other 8 are `test_no_float_in_calculations.py`, which is parametrised over `rglob("*.py")` across
+`domain/` and `pricing/`. Four new modules landed in those two layers and were swept into the no-float
+guarantee automatically, two checks each. I did not edit that test. The new arithmetic is covered by a
+guard I wrote in an earlier phase, which is the best argument I have for structural checks over
+maintained lists.
+
+**Not verified, and not claimed:**
+
+- **No real model was ever called.** Everything above ran against `MockLlmProvider`. Prompt wording,
+  token limits, JSON-schema adherence and latency of an actual vendor are all untested. A real adapter
+  must emit `confidence` and `likelihood` as *strings* (ADR-025); the shipped `system_instructions` say
+  so, and whether a given vendor obeys that is unknown.
+- **No persistence.** Investigations live in a local variable. The Phase 2 acceptance criterion "killing
+  the process mid-investigation and resuming completes without duplicating rows" is still unticked in
+  the README, because nothing here could satisfy it.
+- **The database remains unreachable** (`db` hostname does not resolve; no Docker daemon), so the 62
+  integration tests still skip and none of the five duplicate-adjustment layers is proven.
+- **The review and adjustment services do not exist**, so NEP-04, NEP-05 and FR-007 to FR-010 are
+  untouched, and the concurrency test that is supposed to be the proof for NEP-05 has not been written.
+
+### 11.6 Git state
+
+Phase 2 was committed and pushed as `a594326` after inspecting staged, unstaged, untracked and deleted
+files for secrets and generated artefacts. **Phase 3 is intentionally uncommitted and unpushed** — it
+is mid-slice, and the reviewer may want to see the diff rather than a commit. Nothing was discarded at
+any point, and no force-push or history rewrite was used.
