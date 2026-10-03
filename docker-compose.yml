@@ -1,0 +1,85 @@
+# ResolveIQ — local development stack.
+#
+#   docker compose up --build
+#
+# Services:
+#   db    PostgreSQL 16 (dev credentials only — see .env.example)
+#   api   FastAPI backend, hot-reloading, migrations applied on start
+#   web   Vite dev server for the React frontend
+#
+# SECURITY: only the `api` service receives LLM_* and POSTGRES_* variables.
+# The `web` service receives no secrets, and no VITE_* secret may ever be added
+# (Vite inlines VITE_* into the browser bundle — see NEP-09).
+
+name: resolveiq
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-resolveiq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local-only}
+      POSTGRES_DB: ${POSTGRES_DB:-resolveiq}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The API waits for this, so `docker compose up` works from a cold start.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-resolveiq} -d ${POSTGRES_DB:-resolveiq}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-resolveiq}:${POSTGRES_PASSWORD:-change-me-local-only}@db:5432/${POSTGRES_DB:-resolveiq}
+      POSTGRES_HOST: db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      # Keep the image's site-packages; only mount source for hot reload.
+      - /app/.venv
+    depends_on:
+      db:
+        condition: service_healthy
+    # NOTE: `alembic upgrade head` is added in Phase 1, together with the first
+    # migration. Running it today would fail because there is no migration yet.
+    command: >
+      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    environment:
+      # Not a secret. The API base URL is public by definition.
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api
+    # `npm install` runs on first start; node_modules is a named volume so the
+    # container's Linux binaries are not shadowed by the host's Windows ones.
+    #
+    # NOT YET USABLE: frontend/package.json does not exist (Phase 4). Until then
+    # start only the services that exist:  docker compose up db api
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0"
+
+volumes:
+  pgdata:
