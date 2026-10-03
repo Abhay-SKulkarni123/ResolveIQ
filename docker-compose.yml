@@ -49,8 +49,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    # NOTE: `alembic upgrade head` is added in Phase 1, together with the first
-    # migration. Running it today would fail because there is no migration yet.
+    # NOTE: `alembic upgrade head` is deliberately NOT run on start.
+    # The first migration now exists (backend/migrations/versions/0001_initial_schema.py),
+    # but this file could not be exercised in the environment where it was written,
+    # because no Docker daemon was available. Rather than ship an unverified start
+    # command, migrations are run explicitly:  cd backend && alembic upgrade head
+    # Wire it in once the container path has actually been observed to work.
     command: >
       sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     healthcheck:

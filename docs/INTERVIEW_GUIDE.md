@@ -197,18 +197,63 @@ show confidence and citations rather than verdicts.
 
 | Layer | Needs DB | Needs network | Proves |
 | --- | --- | --- | --- |
-| `unit/` | No | No | `Money`, pricing rules, state machines, citation validator, fingerprints |
+| `unit/` | No | No | `Money`, pricing rules, state machines, citation validator, fingerprints, ORM schema declarations |
 | `contract/` | No | No | Every `LlmProvider` obeys the same safety obligations |
-| `integration/` | Yes | No | Repos, migrations, and the **concurrency test** for NEP-05 |
+| `integration/` | Yes | No | Repos, migrations, **every database constraint**, and the concurrency test for NEP-05 |
 | frontend unit | No | No | Components, money *formatting*, staleness badges |
 | frontend e2e | Yes | No | Dispute → investigate → review → adjust |
 
-`tests/unit/` importing anything from `adapters/` is a test failure. That single check is what makes the
-dependency inversion in `ADR-002` real rather than aspirational.
+Nothing under `app/domain/` or `app/pricing/` may import `sqlalchemy`, `fastapi`, or another `app/` layer.
+`tests/unit/test_layer_boundaries.py` walks their ASTs and fails on a forbidden import, which is what
+makes the dependency inversion in ADR-002 real rather than aspirational. The check runs against `app/`
+rather than against `tests/`, because a test for the ORM adapter has to import the ORM adapter; see
+`docs/SOLID.md` for the clarification this required.
 
 The **golden-fixture** approach is worth mentioning: the seed data has a known-bad invoice with a
 hand-computed correct answer, so the pricing engine is tested against a human-derived expected value, not
 against whatever the code currently produces.
+
+---
+
+## 7a. Talking about the database layer
+
+This is the part most candidates wave through, so it is worth being able to defend in detail.
+
+**"How do you know the money is exact?"** Three independent layers, and I would name all three:
+
+1. `Money` (ADR-001) refuses a `float` at construction rather than coercing it, because
+   `Decimal(0.1)` is not `0.1` and coercing hides a bug instead of fixing it.
+2. The columns are `NUMERIC(19,4)` (ADR-011). A test asserts that no column in the schema has a
+   floating-point type, so the guarantee survives someone adding a column later.
+3. The domain never mutates the ambient `decimal` context, so precision does not depend on which
+   thread or request happened to run first.
+
+**"Why 19,4 and not 10,2?"** Because a unit price of `0.0007` per API call has to be storable. With two
+decimal places it rounds to `0.00` or `0.01` and the error is invisible until a customer disputes an
+invoice. There is an integration test that writes `0.0007` and reads back `0.0007`.
+
+**"What does the database actually enforce?"** Only what is true of the *representation*: precision,
+non-negativity, currency format, and that a `tier_schedule` exists exactly when the mode is `TIERED`.
+What is true of the *business* — that a commitment term has a floor, that tier thresholds ascend — stays
+in the domain. Putting business rules in `CHECK` constraints means writing the same rule twice, in two
+languages, and watching them disagree. That line is ADR-020, and the one place I knowingly accepted a
+weaker database is the internal shape of the JSON tier ladder, which the pricing layer validates instead.
+
+**"What happens on delete?"** `RESTRICT` on every foreign key, written out explicitly even where it is
+PostgreSQL's default. In a billing system a cascade deletes the financial history a dispute is about, as
+a side effect of removing a parent row. There are two integration tests that try to delete an account with
+contracts and a contract with price terms, and assert PostgreSQL refuses.
+
+**"How do you know the migration matches the models?"** Three ways: `alembic check` in CI, an
+`upgrade → downgrade → upgrade` round trip that compares the constraint sets after each pass, and a unit
+test that renders both the migration's DDL and the models' DDL and compares them column by column. The
+last one is the one that has caught real bugs — it is how I found that a `CHECK` constraint written with
+its already-prefixed name was being double-prefixed by the naming convention, and how the longest names
+were arriving from PostgreSQL truncated to 63 characters with a hash suffix.
+
+**"How do you know your tests are not lying?"** The destructive part runs against a separate disposable
+database, and a fixture refuses to run if the database name is not the expected one. The role that runs
+the tests is not a superuser, so a test run cannot quietly escalate its own privileges (ADR-021).
 
 ---
 

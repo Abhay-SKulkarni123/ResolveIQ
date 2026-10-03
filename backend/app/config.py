@@ -8,15 +8,35 @@ mode string rather than a value (NEP-09).
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+#: Database used by the migration integration tests. It is disposable:
+#: `alembic downgrade base` drops every table in it.
+TEST_DATABASE_NAME = "resolveiq_test"
+
+
+def _sibling_database_url(url: str, database_name: str) -> str:
+    """Return ``url`` pointing at a different database on the same server.
+
+    Keeps the scheme, credentials, host and port of ``url`` and replaces only the
+    database name, so the development and test databases cannot drift apart in
+    host or password.
+    """
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(path=f"/{database_name}"))
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # The repository keeps `.env` at its root while every command runs from
+        # `backend/` (see the Makefile), so a bare ".env" would never be found.
+        # Later entries win in pydantic-settings, so a backend-local file still
+        # overrides the shared one.
+        env_file=("../.env", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -27,10 +47,20 @@ class Settings(BaseSettings):
     app_log_level: str = "INFO"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    # NoDecode stops pydantic-settings from running json.loads() on the raw value.
+    # Without it, the comma-separated form documented in .env.example is a hard
+    # startup error, because a bare `http://localhost:5173` is not valid JSON.
+    # With it, _split_origins below decides how to read the value.
+    cors_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:5173"]
+    )
 
     # -- database ------------------------------------------------------------
     database_url: str = "postgresql+psycopg://resolveiq:resolveiq@localhost:5432/resolveiq"
+
+    # Disposable database for the migration integration tests. Empty means
+    # "derive it from database_url"; set it explicitly only to override the host.
+    test_database_url: str = ""
 
     # -- llm -----------------------------------------------------------------
     # STK-06: "mock" is the default so the app runs offline and tests are
@@ -58,14 +88,30 @@ class Settings(BaseSettings):
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
-        """Accept a comma-separated string as well as a JSON list."""
+        """Accept a comma-separated string as well as a list.
+
+        The comma-separated form is what .env.example documents. NoDecode above is
+        what lets it arrive as a plain string: without it pydantic-settings would
+        try to json.loads() the value first and fail on anything that is not a
+        JSON array.
+        """
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
-    @property
-    def is_sqlite(self) -> bool:
-        return self.database_url.startswith("sqlite")
+    @model_validator(mode="after")
+    def _derive_test_database_url(self) -> Settings:
+        """Default the test database URL to a sibling of the development one.
+
+        The migration tests run ``alembic downgrade base``, which drops every
+        table. Pointing them at a separate database is what keeps that from
+        destroying development data, and deriving the URL rather than repeating
+        it means a change of host or password cannot leave the two pointing
+        somewhere different.
+        """
+        if not self.test_database_url:
+            self.test_database_url = _sibling_database_url(self.database_url, TEST_DATABASE_NAME)
+        return self
 
 
 @lru_cache

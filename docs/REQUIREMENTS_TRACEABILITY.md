@@ -132,6 +132,22 @@ These are tracked in full in `docs/ENGINEERING_DECISIONS.md` §"Open questions".
 | OQ-09 | Expected data volume / latency budget for an investigation? | §14 | Not yet stated; current design targets a single-digit-second investigation for demo-scale data. |
 | OQ-10 | Is `dispute.description` allowed to be arbitrarily long, and is there a size cap? | NFR-007 | Cap at 10,000 characters with a clear 422. |
 
+### 7a. Open schema questions (raised by Phase 1 Slice 1)
+
+These are not in the OQ list above because they were discovered while writing the first migration rather
+than during the design phase. All three are recorded in `SYSTEM_DESIGN.md` §3.2 with the correction cost
+for each.
+
+| # | Question | Assumption in the meantime | Cost of being wrong |
+| --- | --- | --- | --- |
+| SQ-01 | What are the legal values of `contracts.status`? | `DRAFT`, `ACTIVE`, `SUPERSEDED`, `TERMINATED`, enforced by a generated `CHECK` | Low — widen one enum and one constraint |
+| SQ-02 | What are the legal values of `contract_price_terms.billing_mode`? | `PER_UNIT`, `TIERED`, `COMMITMENT`, matching the calculators named in SYSTEM_DESIGN §6.3 | Low — same as SQ-01 |
+| SQ-03 | Are contract `external_id`s unique globally or only within an account? | Unique globally, matching `accounts` | Medium — needs `UNIQUE (account_id, external_id)` and a migration if per-account |
+
+SQ-01 and SQ-02 are stored as `CHECK`-constrained strings rather than PostgreSQL enum types specifically so
+that being wrong is cheap. No document in the repository enumerates either vocabulary, so these are
+assumptions and are labelled as such in the code that implements them.
+
 ---
 
 ## 8. Coverage summary
@@ -140,11 +156,18 @@ These are tracked in full in `docs/ENGINEERING_DECISIONS.md` §"Open questions".
 | --- | --- | --- | --- |
 | Product story (PST) | 8 | 0 | 8 |
 | Non-negotiable principles (NEP) | 10 | 0 | 8 (2 partial) |
-| Stack (STK) | 6 | 0 | 3 (3 partial) |
-| Documentation (DOC) | 8 | 8 (drafted, Phase 0) | 0 |
+| Stack (STK) | 6 | 1 | 2 (3 partial) |
+| Documentation (DOC) | 8 | 8 | 0 |
 | Derived functional (FR) | 16 | 0 | 16 |
 | Derived non-functional (NFR) | 7 | 0 | 4 (3 partial) |
 
+STK-03 (SQLAlchemy 2.0 + Alembic) moved to implemented in Phase 1 Slice 1: three tables, a reversible
+migration, and 62 integration tests asserting the schema. Those tests are written and **have not been
+executed against a live server yet** — the database role did not exist when the code was written. See
+`AGENT_USAGE.md` §9.
+
 **Honest read:** this is a foundation. The two partially-covered principles (NEP-01, NEP-09) have
 foundations in place and unit tests for the money value object, but the billing domain itself does not
-exist yet. Nothing here should be read as "feature complete".
+exist yet. Nothing here should be read as "feature complete". In particular, a schema that has been
+declared and unit-tested is not the same as a schema that has been accepted by PostgreSQL, and this
+repository does not yet claim the latter.

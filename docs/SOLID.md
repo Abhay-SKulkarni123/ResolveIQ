@@ -186,8 +186,22 @@ Wiring happens in exactly one place — `app/api/deps.py` (composition root) —
 allowed to know both FastAPI and SQLAlchemy. This is why `pricing/` unit tests need no fixtures, no
 container, and no `pytest.mark.asyncio`: they are ordinary function tests.
 
-**The test that proves DIP is real:** `tests/unit/` must import nothing from `adapters/`. If it does, an
-abstraction has leaked. This is checkable with an AST-walking pytest test (Phase 1) and it fails loudly.
+**The test that proves DIP is real:** nothing under `app/domain/` or `app/pricing/` may import
+`sqlalchemy`, `fastapi`, `pydantic`, or any other `app/` layer. If one does, an abstraction has leaked.
+This is checked by `tests/unit/test_layer_boundaries.py`, which walks the AST of every module in those two
+packages and fails on a forbidden import.
+
+**One clarification to what this rule said before it was implemented.** The original wording was "`tests/unit/`
+must import nothing from `adapters/`". Enforced against the whole test tree, that rule bans the ORM tests:
+a test for the persistence adapter necessarily imports the persistence adapter, so the only way to satisfy
+it would be to not write those tests. The invariant actually worth protecting is that *production* inner
+code stays free of outer dependencies, so that is what the check asserts, against `app/` rather than against
+`tests/`. The ORM tests live in `tests/unit/test_persistence_models.py` and
+`tests/integration/test_constraints.py`, and they are free to import the adapter they are testing.
+
+Two guards keep the check from passing vacuously: one asserts that each layer actually contains modules,
+because an empty glob would satisfy every assertion, and the other names the specific rule in the failure
+message rather than listing forbidden module names.
 
 ---
 

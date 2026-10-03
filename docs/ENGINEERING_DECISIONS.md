@@ -497,6 +497,164 @@ meaningless to a human reading a ticket or a screenshot.
 
 ---
 
+## ADR-018 — Deterministic constraint names in the MetaData
+
+**Status:** Accepted
+
+**Context.** Alembic's autogenerate compares constraint *names* as well as shapes. A `CHECK`
+constraint written without a name therefore compares unequal to itself across runs, so every
+`alembic revision --autogenerate` proposes a migration that only renames it. Worse, the name
+PostgreSQL actually stores is what a reviewer reads in an error message and what a `DROP CONSTRAINT`
+needs.
+
+**Decision.** `Base.metadata` carries a `naming_convention` dict, so every constraint name is derived
+from the table and columns rather than typed out:
+
+```
+ix  -> ix_<table>_<columns>
+uq  -> uq_<table>_<columns>
+ck  -> ck_<table>_<explicit name>     # the name is required, and short
+fk  -> fk_<table>_<column>_<referred table>
+pk  -> pk_<table>
+```
+
+The `ck` entry interpolates an explicit name, so every `CheckConstraint` must pass `name=`. That is the
+point: it forces a short readable name instead of one derived from the first hundred characters of a SQL
+expression.
+
+**The trap this creates, and the rule that follows.** Because the convention applies to migrations too,
+a `CheckConstraint` written into a migration file must use the **bare** name. Passing the finished name
+produces `ck_accounts_ck_accounts_external_id_not_blank`, and the longest ones come back from PostgreSQL
+truncated to 63 characters with a hash suffix (`ck_contract_price_terms_ck_contract_price_terms_minimum_ab89`).
+Both are silent: the migration succeeds and only the resulting schema is wrong. `alembic upgrade head
+--sql` prints the offending names, and `tests/unit/test_persistence_models.py` asserts that every
+constraint name fits the identifier limit.
+
+**Consequences.**
+- Autogenerate is stable and produces empty migrations when nothing changed.
+- Tests can assert on exact constraint names, which is how `tests/integration/test_constraints.py`
+  proves a rule is enforced rather than merely declared.
+- A hand-written migration must repeat the bare names. This is duplicated on purpose: a migration that
+  imported the model's constants would change meaning when the models change, and a migration must
+  describe the schema as it was when it was written.
+
+**Alternatives rejected.**
+- *Name nothing* — unstable autogenerate, unreadable errors, unassertable constraints.
+- *Let Alembic generate names from the expression* — truncated, hashed, and unstable across edits.
+
+---
+
+## ADR-019 — Surrogate UUID keys, and `RESTRICT` on every foreign key
+
+**Status:** Accepted
+
+**Context.** These tables mirror records owned by the customer's billing system, and an investigation
+must be reproducible against the exact records it saw (FR-002). Two decisions follow from that, and
+neither is obvious enough to leave unstated.
+
+**Decision.**
+
+1. Every table has a surrogate `uuid` primary key generated in Python by `uuid4`. The source system's
+   identifier lives in a separate `external_id` column with a uniqueness constraint.
+2. Every foreign key states `ondelete="RESTRICT"`, including where that is PostgreSQL's default.
+3. No `updated_at` column. Source rows are append-only: a change of commercial terms produces a new
+   effective-dated `contracts` row rather than an edit.
+
+**Consequences.**
+- A re-ingest that finds two rows claiming one source identifier has distinct rows to reconcile, rather
+  than silently overwriting one with the other. Uniqueness on `external_id` then surfaces the conflict
+  as a constraint violation instead of as missing data.
+- Deleting an account that still has contracts is an error the caller must handle. A cascade would
+  destroy the financial history a dispute is about as a side effect of removing a parent row, which is
+  the worst possible failure mode for this domain.
+- Python-side generation means the key is visible without a round trip and the schema carries no
+  dependency on a particular PostgreSQL version's UUID function.
+- Writing the default delete behaviour out costs three words per foreign key and makes the intent
+  reviewable. A reader should not have to know what PostgreSQL does by default to know what this schema
+  does.
+- Without `updated_at` there is no mutable-row audit trail. That is acceptable because reproducibility
+  rests on the immutable evidence snapshot (ADR-006), not on row history.
+
+**Alternatives rejected.**
+- *Source identifier as primary key* — couples our schema to theirs, and is the same mistake ADR-017
+  rejected for evidence keys.
+- *`bigserial`* — enumerates accounts, which is unnecessary information to leak and makes ids
+  meaningful across databases in a way that invites cross-database joins.
+- *`CASCADE`* — destroys billing history silently.
+- *`updated_at`* — implies an editing workflow that does not exist.
+
+---
+
+## ADR-020 — The database checks the shape of money; the domain checks its meaning
+
+**Status.** Accepted
+
+**Context.** The `CHECK` constraints in `contract_price_terms` protect two different kinds of mistake,
+and drawing the line between them decides where future billing logic lives.
+
+**Decision.** The database enforces what is true of the *representation*, and nothing else:
+
+- money is `NUMERIC(19,4)` and never a floating-point type (ADR-011)
+- amounts and quantities are not negative
+- currency is three uppercase letters
+- `status` and `billing_mode` are members of the enums in `app/domain/contracts.py`
+- `tier_schedule` is present exactly when `billing_mode = 'TIERED'`
+
+The domain enforces what is true of the *business*: that a `COMMITMENT` term has a
+`minimum_commitment`, that a tier ladder's thresholds ascend and do not overlap, that a term's currency
+matches its account's, and that `effective_from` falls in the period the usage occurred.
+
+**Consequences.**
+- The `CHECK` value lists are generated from the Python enums, so the database and the domain cannot
+  drift apart; a new enum member widens the constraint in the same commit.
+- The internal shape of `tier_schedule` is *not* checked in SQL. Duplicating the tier semantics in a
+  `CHECK` would create two definitions that drift, and the tier ladder is read only by
+  `app/pricing/tiered.py`. A malformed ladder is therefore rejected by the pricing layer rather than by
+  the database, which is an accepted and stated gap.
+- The same rule keeps `contract_price_terms.currency` equal to `accounts.currency` out of SQL: a
+  cross-table check needs a trigger, and triggers put billing logic in the storage layer.
+
+**Alternatives rejected.**
+- *A JSON-schema `CHECK` on `tier_schedule`* — duplicates the domain definition and still cannot express
+  cross-row rules.
+- *A PostgreSQL enum type* — changing the legal values means a type migration rather than a cheap
+  constraint change, and the vocabulary is explicitly still under discussion (SYSTEM_DESIGN §3.2).
+
+---
+
+## ADR-021 — Least-privilege database role for development and tests
+
+**Status.** Accepted
+
+**Context.** ADR-010 relies on PostgreSQL grants to make the audit log append-only, so the shape of the
+development role is a security decision and not just convenience. A superuser-prompted test suite can
+defeat any grant-based control, because the role that runs it can always grant itself more.
+
+**Decision.** Two databases, `resolveiq` and `resolveiq_test`, both owned by a single `resolveiq` role
+that is `NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`. `backend/scripts/create_dev_database.sql`
+creates it idempotently and reports the resulting privileges.
+
+**Consequences.**
+- The role owns exactly the two databases the project needs, which is the minimum that lets
+  `alembic upgrade head` and `alembic downgrade base` work: DDL on its own tables.
+- It cannot create databases, create roles, or bypass row-level security, so a compromised test run
+  cannot escalate.
+- The destructive part of the migration test (`alembic downgrade base` drops every table) is confined to
+  `resolveiq_test` by construction rather than by care. `Settings.test_database_url` derives the test
+  database from the development one by swapping only the database name, so the two cannot drift apart in
+  host or password, and a conftest fixture refuses to run if the database name is not `resolveiq_test`.
+- The password lives in the gitignored `.env`. `Settings` reads `../.env` as well as `./.env` because
+  every documented command runs from `backend/` while the repository keeps `.env` at its root; without
+  that, the documented "put your credentials in `.env`" instruction silently did nothing.
+
+**Alternatives rejected.**
+- *Reusing a superuser for tests* — the usual arrangement, and the reason grant-based controls like
+  ADR-010 are so often untested.
+- *Docker Compose for the test database* — not available on every machine, and it would have left this
+  schema unverified on a developer laptop.
+
+---
+
 ## Open questions
 
 Tracked in full in `REQUIREMENTS_TRACEABILITY.md` §7. Condensed here with the decision each one blocks.

@@ -144,7 +144,7 @@ investigation is reproducible against the exact records it saw (FR-002).
 | --- | --- | --- |
 | `accounts` | Customer and its billing currency | `external_id`, `name`, `currency` |
 | `contracts` | Effective-dated commercial agreement | `effective_from`, `effective_to`, `status` |
-| `contract_price_terms` | **The pricing rules.** One row per metered metric | `metric_key`, `billing_mode`, `unit_price`, `included_units`, `tier_schedule` (JSONB), `overage_price`, `minimum_commitment`, `rounding_mode` |
+| `contract_price_terms` | **The pricing rules.** One row per metered metric | `metric_key`, `billing_mode`, `unit_price`, `included_units`, `tier_schedule` (JSONB), `overage_price`, `minimum_commitment` |
 | `invoices` | Billing document | `period_start/end`, `currency`, `stated_total`, `computed_total`, `amount_paid`, `balance` |
 | `invoice_line_items` | What the customer was actually charged | `line_type`, `metric_key`, `quantity`, `unit_price`, `amount`, `pricing_term_id` |
 | `usage_events` | Metered usage records | `occurred_at`, `quantity`, `unit`, `dimensions` (JSONB), `dedupe_key` (unique) |
@@ -159,6 +159,60 @@ reduce balance" — no LLM needed. A weak system would send that to the model an
 `invoices` deliberately stores **both** `stated_total` and `computed_total`. When they differ, that
 difference is not an exception — it is a reconciliation finding, and it is often the answer
 (PST-04/FR-005).
+
+#### Resolved and open schema questions
+
+`accounts`, `contracts` and `contract_price_terms` are implemented. The other five tables above are
+Phase 2 work and are deliberately absent rather than stubbed.
+
+**Resolved: `rounding_mode` is not a column.** The table above listed it on `contract_price_terms`,
+which contradicted §6.2. A column implies the rounding rule is configured per contract, while §6.2
+states there is exactly one rounding policy, in one module, pinned by tests. Both cannot hold. The
+column was dropped rather than added and left unread: a nullable column that nothing reads is worse
+than no column, because it looks like configuration. Rounding is applied by `app/pricing/rounding.py`
+and nowhere else.
+
+**Resolved: identifiers.** Each table has a surrogate `uuid` primary key generated in Python, and the
+source system's own identifier lives in `external_id` with a uniqueness constraint. The surrogate keeps
+our schema independent of theirs (the same reasoning as ADR-017) and means a re-ingest that finds two
+rows claiming one source identifier has distinct rows to reconcile rather than silently overwriting.
+
+**Resolved: deletes are `RESTRICT`.** Every foreign key states its delete behaviour explicitly. A
+cascade would destroy the financial history a dispute is about as a side effect of tidying up a parent
+row. Deleting an account that still has contracts is an error somebody must handle deliberately.
+
+**Open: the legal values of `status` and `billing_mode`.** Neither is enumerated anywhere in the design.
+`app/domain/contracts.py` defines the minimum set the system can act on — `DRAFT`, `ACTIVE`,
+`SUPERSEDED`, `TERMINATED` and `PER_UNIT`, `TIERED`, `COMMITMENT` — and the database `CHECK`
+constraints are generated from those enums so the two cannot drift. **These are assumptions, not
+findings.** If the real billing system uses a different vocabulary, the enum and one migration are the
+only things that change. They are stored as `CHECK`-constrained strings rather than native enum types
+precisely so that correction is cheap.
+
+**Open: `external_id` is unique on its own rather than per parent.** Source systems generally mint
+contract identifiers globally, but no document in the repository guarantees it. If they are only unique
+within an account, `contracts` needs `UNIQUE (account_id, external_id)`.
+
+**Open: the shape of `tier_schedule`.** The database checks only that a ladder is present exactly when
+`billing_mode = 'TIERED'`. The ladder's internal structure is left to the domain, because putting it in
+a `CHECK` would duplicate the tier semantics in SQL and in Python and guarantee the two eventually
+disagree. The trade-off is accepted: a malformed ladder is rejected by the pricing layer rather than by
+the database.
+
+#### Money and currency storage
+
+Monetary columns are `NUMERIC(19,4)` (ADR-011) and map to `Decimal`, never to `float` and never to the
+`Money` value object. `Money` belongs to the domain and is what the pricing layer computes with;
+mapping it onto a column would tie the storage format to the domain type and drag domain validation into
+every load path.
+
+Currency is stored explicitly wherever money is stored: `accounts.currency` is the settlement currency
+and `contract_price_terms.currency` is the currency of the amounts on that row. ResolveIQ performs no FX
+conversion (OQ-04), so the two are expected to agree, but that equality is a domain rule and not a
+cross-table database constraint: enforcing it in the database would require a trigger and would put
+billing logic in the storage layer. Currency codes are three uppercase letters with a format check
+rather than a foreign key, so an unrecognised ISO 4217 code can be stored instead of being rejected at
+the boundary.
 
 ### 3.3 Investigation entities (ours)
 
@@ -726,14 +780,32 @@ Acceptance criteria per phase are in `README.md` §"Phases".
 
 Being explicit so this document is not over-read:
 
+**Phase 0 — foundation**
+
 - ✅ `docs/*` — all seven documents drafted.
 - ✅ `.env.example`, `.gitignore`, `docker-compose.yml`, `Makefile`.
 - ✅ `backend/app/config.py` — typed settings from env.
 - ✅ `backend/app/domain/money.py` — the `Money` value object, with `tests/unit/test_money.py`.
 - ✅ `backend/app/main.py` — app factory with `/api/v1/health`.
 
-**Not built:** the database models, migrations, pricing engine, evidence pipeline, LLM adapters,
-investigation service, review/adjustment services, and the entire frontend.
+**Phase 1, Slice 1 — persistence foundation**
+
+- ✅ `backend/app/domain/contracts.py` — `ContractStatus` and `BillingMode`, shared by the ORM constraints
+  and by whatever reads them later.
+- ✅ `backend/app/adapters/persistence/` — `Base` with deterministic constraint naming, the three models,
+  and the engine/session lifecycle with credential-safe failure reporting.
+- ✅ `backend/alembic.ini`, `backend/migrations/` — `env.py` that reads the URL from the environment and
+  never from the app, and the initial migration for the three tables.
+- ✅ `backend/scripts/create_dev_database.sql` — idempotent, least-privilege role and databases.
+- ✅ Tests: 145 unit (schema declarations, credential redaction, layer boundaries, settings) and 62
+  integration (round trip, migration reversibility, every constraint).
+
+**Not built:** the repository layer and session-per-request wiring, the pricing engine, the evidence
+pipeline, LLM adapters, the investigation service, review/adjustment services, and the entire frontend.
+
+**Not yet verified:** the 62 integration tests have never been executed, because the database role did not
+exist when they were written. The schema is *declared and unit-tested*, not *accepted by PostgreSQL*. See
+`AGENT_USAGE.md` §9.6.
 
 The `Money` value object was built first on purpose: NEP-01 is the principle everything else leans on,
 and it is the one piece where being wrong is silently expensive.
