@@ -831,7 +831,12 @@ Being explicit so this document is not over-read:
 **Phase 3 — review and audit**
 
 - ✅ Append-only reviews with the evidence fingerprint the reviewer actually saw.
-- ✅ Audit event stream written from the same transaction as the state change it describes.
+- ✅ Reviewer decisions are durable and append-only in `finding_reviews`, each carrying the
+  `evidence_fingerprint` the reviewer was looking at.
+- ❌ **`audit_events` is not built.** There is no audit table, no audit writer and no audit route.
+  `finding_reviews` is the only durable decision history, and it records reviewer annotations
+  only — not case creation, evidence attachment, investigation or reopen. §17 previously claimed
+  an audit event stream here; that was wrong. See NEP-06 and FR-014.
 
 **Phase 4 — case API, persistence and the reviewer workbench**
 

@@ -657,12 +657,18 @@ maintained lists.
   the README, because nothing here could satisfy it.
 - **The database remains unreachable** (`db` hostname does not resolve; no Docker daemon), so the 62
   integration tests still skip and none of the five duplicate-adjustment layers is proven.
-- **The review and adjustment services do not exist**, so NEP-04, NEP-05 and FR-007 to FR-010 are
-  untouched, and the concurrency test that is supposed to be the proof for NEP-05 has not been written.
+- **The adjustment service does not exist**, so NEP-04, NEP-05 and FR-007 to FR-010 are untouched,
+  and the concurrency test that is supposed to be the proof for NEP-05 has not been written. The
+  *review* service was built in Phase 4; approval and adjustment were not.
 
 ### 11.6 Git state
 
-Phase 2 was committed and pushed as `a594326` after inspecting staged, unstaged, untracked and deleted
-files for secrets and generated artefacts. **Phase 3 is intentionally uncommitted and unpushed** — it
-is mid-slice, and the reviewer may want to see the diff rather than a commit. Nothing was discarded at
-any point, and no force-push or history rewrite was used.
+Phase 2 was committed and pushed as `a594326`, Phase 3 as `84b7079`, and Phase 4 as `bf5fbda`, each
+after inspecting staged, unstaged, untracked and deleted files for secrets and generated artefacts.
+Nothing was discarded at any point, and no force-push or history rewrite was used; every push has been
+a fast-forward.
+
+**This section has not caught up.** It still describes Phase 3 as the current state, and there is no
+Phase 4 section: the dispute case API, the persistence integration, the reviewer workbench and the
+`audit_events` gap found during the Phase 4 status audit are not described here. Treat §11 as a record
+of Phases 1–3 only.
