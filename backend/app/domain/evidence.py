@@ -32,8 +32,10 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from types import MappingProxyType
 from typing import Any
+
+from app.domain.json_frozen import freeze_json as deep_freeze
+from app.domain.json_frozen import thaw_json
 
 __all__ = [
     "EvidenceBundle",
@@ -76,38 +78,6 @@ class EvidenceType(str, Enum):
     DISPUTE_TEXT = "DISPUTE_TEXT"
 
 
-def _thaw(value: Any) -> Any:
-    """Convert a deep-frozen structure back into plain JSON-compatible data.
-
-    :func:`deep_freeze` produces ``MappingProxyType`` and ``tuple`` values that
-    ``json.dumps`` cannot serialise directly. Converting them back here means the bytes
-    hashed are identical to those of the original ``dict``/``list`` structure, so
-    freezing a snapshot cannot change its ``content_hash``.
-    """
-    if isinstance(value, Mapping):
-        return {key: _thaw(nested) for key, nested in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_thaw(nested) for nested in value]
-    return value
-
-
-def deep_freeze(value: Any) -> Any:
-    """Return ``value`` with every mapping and sequence made read-only, recursively.
-
-    ``@dataclass(frozen=True)`` stops a caller rebinding ``item.snapshot``, but it does
-    nothing to the ``dict`` inside. Without this, ``item.snapshot["rate"] = ...`` would
-    silently change the record's content while ``content_hash`` — frozen at construction —
-    kept describing the *old* content. That is precisely the failure ADR-006 exists to
-    prevent: a fingerprint that no longer describes what it fingerprints, on the exact
-    object a reviewer is supposed to be able to trust.
-    """
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: deep_freeze(nested) for key, nested in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(deep_freeze(nested) for nested in value)
-    return value
-
-
 def canonical_json(value: Any) -> str:
     """Serialise ``value`` so that equal content always yields equal bytes.
 
@@ -120,7 +90,7 @@ def canonical_json(value: Any) -> str:
     ``ensure_ascii=False`` leaves text as UTF-8 so a dispute description in any language
     hashes on its actual characters.
     """
-    return json.dumps(_thaw(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(thaw_json(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def content_hash_of(snapshot: Any) -> str:

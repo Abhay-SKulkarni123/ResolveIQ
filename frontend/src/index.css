@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-canvas text-ink font-sans antialiased;
+}
+
+/* Monetary figures are tabular so columns of digits line up and a reviewer can
+   compare them down the page. Proportional digits make 1/0 look like 7/8. */
+@layer components {
+  .amount {
+    @apply font-mono tabular-nums;
+  }
+}

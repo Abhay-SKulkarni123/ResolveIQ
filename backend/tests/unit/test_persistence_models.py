@@ -16,7 +16,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import CheckConstraint, Float, Numeric, UniqueConstraint, Uuid
+from sqlalchemy import CheckConstraint, DateTime, Float, Numeric, UniqueConstraint, Uuid
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
@@ -31,7 +31,33 @@ from app.adapters.persistence import (
 from app.domain.contracts import BILLING_MODE_VALUES, CONTRACT_STATUS_VALUES
 
 DIALECT = postgresql.dialect()
-EXPECTED_TABLES = {"accounts", "contracts", "contract_price_terms"}
+
+#: Phase 1-2: the source-of-truth tables imported from the billing system.
+SOURCE_TABLES = {"accounts", "contracts", "contract_price_terms"}
+
+#: Phase 4: disputes, their immutable evidence, calculations, investigations and the
+#: reviewer's annotations.
+DISPUTE_TABLES = {
+    "disputes",
+    "dispute_evidence_items",
+    "calculations",
+    "investigations",
+    "investigation_evidence",
+    "investigation_findings",
+    "investigation_hypotheses",
+    "investigation_resolution_options",
+    "finding_reviews",
+}
+
+EXPECTED_TABLES = SOURCE_TABLES | DISPUTE_TABLES
+
+#: The join table between an investigation and the snapshots it read. It has a
+#: composite primary key of the two foreign keys and no surrogate ``id``: the pair
+#: *is* the identity, and a surrogate would allow the same link twice.
+LINK_TABLES = {"investigation_evidence"}
+
+#: Everything except the link tables, for assertions that need a surrogate key.
+TABLES_WITH_ID = EXPECTED_TABLES - LINK_TABLES
 
 MONEY_COLUMNS = ("unit_price", "overage_price", "minimum_commitment")
 QUANTITY_COLUMNS = ("included_units",)
@@ -56,9 +82,14 @@ def unique_column_sets(table_name: str) -> set[tuple[str, ...]]:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_contains_exactly_the_three_source_tables() -> None:
-    # The dispute-side tables belong to later phases. A test that pins the count
-    # makes an accidental extra table visible immediately.
+def test_schema_contains_exactly_the_declared_tables() -> None:
+    """The whole schema, pinned.
+
+    Kept as an exact set rather than a subset check: an accidental table -- a scratch
+    table, a leftover experiment, a second spelling of one that exists -- is
+    otherwise invisible until it reaches a migration and a reviewer has to notice it
+    there. Phase 4 added nine tables to the three source tables.
+    """
     assert set(Base.metadata.tables) == EXPECTED_TABLES
 
 
@@ -78,7 +109,7 @@ def test_no_column_uses_a_floating_point_type() -> None:
     assert offenders == []
 
 
-@pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES))
+@pytest.mark.parametrize("table_name", sorted(SOURCE_TABLES))
 def test_money_columns_are_numeric_19_4(table_name: str) -> None:
     """ADR-011: NUMERIC(19,4) for every monetary column."""
     table = Base.metadata.tables[table_name]
@@ -96,17 +127,40 @@ def test_rendered_ddl_names_the_precision_and_no_float_type() -> None:
         assert forbidden not in ddl
 
 
-def test_timestamps_are_timezone_aware() -> None:
-    for table in Base.metadata.tables.values():
-        created_at = table.columns["created_at"]
-        assert created_at.type.timezone is True, table.name
+def test_every_timestamp_column_is_timezone_aware() -> None:
+    """Any timestamp, not just ``created_at``.
+
+    A naive timestamp in a UTC-only deployment is a latent off-by-hours bug: it
+    reads correctly until a daylight-saving boundary or a server in another zone
+    touches it, and a dispute's ``occurred_at`` is exactly the kind of field that
+    gets compared across sources. The dispute-side tables use ``captured_at`` as
+    well as ``created_at``, so this checks by type rather than by name.
+    """
+    naive = [
+        f"{table.name}.{column.name}"
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        if isinstance(column.type, DateTime) and column.type.timezone is not True
+    ]
+    assert naive == []
 
 
 def test_identifiers_are_native_uuid_columns() -> None:
     # A string primary key would make a foreign key a text comparison and would
     # put the encoding choice in every join.
-    for table in Base.metadata.tables.values():
-        assert isinstance(table.columns["id"].type, Uuid), table.name
+    for table_name in sorted(TABLES_WITH_ID):
+        assert isinstance(Base.metadata.tables[table_name].columns["id"].type, Uuid), table_name
+
+
+def test_link_tables_use_uuid_foreign_keys_rather_than_a_surrogate_key() -> None:
+    """``investigation_evidence`` is identified by the pair it links.
+
+    Both halves are checked because a link table with one uuid and one text column
+    is the failure this catches, and it would still compare as a text join for half
+    of its queries.
+    """
+    for column in Base.metadata.tables["investigation_evidence"].columns:
+        assert isinstance(column.type, Uuid), column.name
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +232,7 @@ def test_primary_key_is_generated_in_python_without_a_round_trip() -> None:
     context, and keeps the original reachable as ``__wrapped__``; that is the
     function to call here.
     """
-    for table_name in sorted(EXPECTED_TABLES):
+    for table_name in sorted(TABLES_WITH_ID):
         default = Base.metadata.tables[table_name].columns["id"].default
         assert default is not None
         factory = getattr(default.arg, "__wrapped__", default.arg)
@@ -242,6 +296,21 @@ def test_foreign_keys_restrict_deletes(
 
 
 def test_foreign_key_names_are_deterministic() -> None:
+    """Every FK name is short enough to survive PostgreSQL, and stable.
+
+    Two of these are deliberately *not* the naming convention's output. The
+    convention would produce
+    ``fk_investigation_resolution_options_investigation_id_investigations`` (67
+    bytes) and
+    ``fk_investigation_evidence_evidence_item_id_dispute_evidence_items`` (65), and
+    PostgreSQL truncates anything past 63 bytes with a hash suffix -- producing a
+    name that differs from the metadata and appears in no ``grep``. The two
+    exceptions are asserted by name here so a future edit cannot quietly replace
+    them with the over-long convention form.
+
+    Every other name is the convention's, which is what keeps a later autogenerated
+    migration a no-op instead of a spurious drop-and-recreate.
+    """
     names = {
         fk.constraint.name  # type: ignore[union-attr]
         for table in Base.metadata.tables.values()
@@ -249,9 +318,42 @@ def test_foreign_key_names_are_deterministic() -> None:
         for fk in column.foreign_keys
     }
     assert names == {
+        # Phase 1-2
         "fk_contracts_account_id_accounts",
         "fk_contract_price_terms_contract_id_contracts",
+        # Phase 4
+        "fk_disputes_account_id_accounts",
+        "fk_disputes_contract_id_contracts",
+        "fk_disputes_current_investigation_id_investigations",
+        "fk_dispute_evidence_items_dispute_id_disputes",
+        "fk_calculations_dispute_id_disputes",
+        "fk_calculations_investigation_id_investigations",
+        "fk_investigations_dispute_id_disputes",
+        "fk_investigation_evidence_investigation_id_investigations",
+        "fk_investigation_findings_investigation_id_investigations",
+        "fk_investigation_hypotheses_investigation_id_investigations",
+        "fk_finding_reviews_dispute_id_disputes",
+        "fk_finding_reviews_investigation_id_investigations",
+        # The two documented short-name exceptions (over 63 bytes if conventional).
+        "fk_investigation_evidence_evidence_item_id_evidence",
+        "fk_investigation_resolution_options_investigation_id",
     }
+
+
+def test_foreign_key_names_fit_postgresql_identifier_limit() -> None:
+    """The real reason for the two exceptions above, asserted on the whole schema.
+
+    Without this the short names look like an inconsistency to be tidied away, and
+    tidying them away silently reintroduces the truncation.
+    """
+    too_long = [
+        fk.constraint.name
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        for fk in column.foreign_keys
+        if len((fk.constraint.name or "").encode("utf-8")) > 63
+    ]
+    assert too_long == []
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +453,7 @@ def test_tier_ladder_exists_exactly_when_the_mode_is_tiered() -> None:
     )
 
 
-@pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES))
+@pytest.mark.parametrize("table_name", sorted(TABLES_WITH_ID))
 def test_every_check_constraint_is_named(table_name: str) -> None:
     """A nameless CHECK cannot be altered without being dropped and recreated."""
     table = Base.metadata.tables[table_name]
@@ -363,7 +465,7 @@ def test_every_check_constraint_is_named(table_name: str) -> None:
     assert unnamed == []
 
 
-@pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES))
+@pytest.mark.parametrize("table_name", sorted(TABLES_WITH_ID))
 def test_check_constraint_names_fit_postgresql_identifier_limit(table_name: str) -> None:
     """PostgreSQL truncates identifiers past 63 bytes, silently and with a hash.
 

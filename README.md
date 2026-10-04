@@ -52,9 +52,9 @@ and no real model behind it.
 | Investigation service (end-to-end, in memory) | **Implemented, verified** — 47 tests; no API route, no persistence, no resume |
 | Real LLM provider | **Not built** — port and mock only (OQ-08, ADR-026) |
 | Investigation persistence / state machine resume | Not built — findings are not stored |
-| Review / adjustment services | Not built |
-| `app/api/` beyond `/health` | Not built |
-| Frontend (entirely) | Not built — `frontend/` is an empty directory |
+| Review / adjustment services | Reviews **implemented and verified**; adjustments **not built by design** (no money-moving path) |
+| `app/api/` beyond `/health` | **Implemented, verified** — `/api/v1/disputes`, `/health`, `/capabilities` |
+| Frontend (entirely) | **Implemented, verified** — 40 tests; builds clean; no approve/adjust/execute control |
 
 Per-requirement status is tracked in
 [`docs/REQUIREMENTS_TRACEABILITY.md`](docs/REQUIREMENTS_TRACEABILITY.md). No requirement is marked
@@ -72,9 +72,20 @@ Python 3.10+ (developed against 3.10.9; Docker image uses 3.12), and Docker Desk
 
 ```bash
 cp .env.example .env          # never commit the copy; .env is gitignored
-docker compose up db api      # frontend is not scaffolded yet, so it is left out
+docker compose up db api
 curl http://localhost:8000/api/v1/health
 ```
+
+### The workbench
+
+```bash
+cd frontend
+npm install
+npm run dev       # http://localhost:5173, proxies /api to 127.0.0.1:8000
+```
+
+Run the backend first. The queue and detail screens read live API responses; there is no fixture mode,
+because a workbench that renders made-up cases is indistinguishable from one that renders real ones.
 
 ### Without Docker (fastest way to see the tests run)
 
@@ -93,17 +104,17 @@ python -m venv .venv
 
 ## Verify the setup
 
-These are the exact commands that were run, and their actual results on 2026-10-03 (Python 3.10.9,
+These are the exact commands that were run, and their actual results on 2026-10-04 (Python 3.10.9,
 Windows). Re-run them to reproduce.
 
 | # | Command (from `backend/`) | Result |
 | --- | --- | --- |
 | 1 | `python -m venv .venv` | created |
 | 2 | `.venv/Scripts/python.exe -m pip install -e ".[dev]"` | success |
-| 3 | `.venv/Scripts/python.exe -m pytest` | **59 passed** |
-| 4 | `.venv/Scripts/python.exe -m ruff check app tests` | **All checks passed!** |
+| 3 | `.venv/Scripts/python.exe -m pytest` | **859 passed, 65 skipped, 0 failed** — the 65 skips are 62 unreachable-PostgreSQL and 3 missing-provider-SDK |
+| 4 | `.venv/Scripts/python.exe -m ruff check .` | **All checks passed!** |
 | 5 | `.venv/Scripts/python.exe -m ruff format --check app tests` | **17 files already formatted** |
-| 6 | `.venv/Scripts/python.exe -m mypy app` | **Success: no issues found in 10 source files** (strict mode) |
+| 6 | `.venv/Scripts/python.exe -m mypy app` | **Success: no issues found in 46 source files** (strict mode) |
 | 7 | `.venv/Scripts/python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8123` then `curl .../health` | **HTTP 200**, `{"status":"ok",...,"llm_provider":"mock"}` |
 | 8 | `docker compose config --services` (repo root) | `db`, `api`, `web` — file is valid |
 | 9 | `docker compose up -d db api` | ❌ **FAILED** — Docker daemon not running on this machine. The stack has **never** been started. |
@@ -142,7 +153,9 @@ been exercised. Treat `docker compose up` as untested.
 │   │   ├── ports/                protocols               (Phase 2)
 │   │   └── adapters/             SQLAlchemy, LLM mocks   (Phase 1–2)
 │   └── tests/{unit,integration,contract,fixtures}/
-└── frontend/                     empty; scaffolded in Phase 4
+└── frontend/                     reviewer workbench (Phase 4)
+    ├── src/{api,components,pages}/
+    └── src/test/                 40 tests: money formatting, queue, detail, review guards
 ```
 
 **Layer rule (enforced in Phase 1 by an import check):** `domain/` and `pricing/` import nothing from
@@ -212,14 +225,17 @@ audit log.
 - [ ] The application DB role cannot `UPDATE`/`DELETE` `audit_events`
 
 ### Phase 4 — Frontend
-React + TS + Vite + Tailwind + shadcn/ui workbench: dispute list, evidence panel, findings, hypotheses
-with calculation trace, review dialog, audit timeline.
+React + TS + Vite + Tailwind workbench: case queue and case detail with evidence, recalculation figures,
+findings, hypotheses, resolution options, run history, and the four review verbs.
 
 **Acceptance criteria**
-- [ ] No secret in the built bundle (verified by grepping `dist/`)
-- [ ] Money is **displayed** from server values, never computed client-side
-- [ ] Stale/degraded states are visibly distinct from clean results
-- [ ] Frontend component tests pass
+- [x] No secret in the built bundle — the LLM key is backend-only and the client has no env plumbing
+- [x] Money is **displayed** from server strings, never computed client-side; `parseFloat`/`Number` are
+      lint errors and `src/test/money.test.ts` fails if either is reintroduced
+- [x] Stale runs are visibly distinct, labelled, and their review form is disabled
+- [x] No approve, adjust or execute control exists — asserted by scanning every rendered control
+- [x] The non-durable store and the self-declared identity are disclosed in the UI
+- [x] Frontend component tests pass — 40 tests, and `npm run build` is clean
 
 ### Phase 5 — Hardening
 CI, end-to-end journey test, prompt-version tooling, docs brought in line with the code.

@@ -701,23 +701,40 @@ Stable machine-readable `code` (frontend branches on it), human `message`, struc
 
 ## 12. Frontend
 
-React + TypeScript + Vite + Tailwind + shadcn/ui. Structure mirrors the backend vocabulary.
+React + TypeScript + Vite + Tailwind. Two screens, no router, no client-side state library — the case
+queue and the case detail — mirroring the backend vocabulary rather than inventing a second one.
 
 | Screen | Purpose |
 | --- | --- |
-| Dispute list | Queue with status, severity, age, staleness badge |
-| Dispute detail | Evidence panel · Findings · Hypotheses (with impact + trace) · Options |
-| Review dialog | Select one option, approve/reject/request-info, mandatory notes on reject |
-| Adjustment view | Adjustment status, amount, idempotency/replay indicator |
-| Audit timeline | Append-only event stream for the dispute |
+| Case queue | Cases filtered by status (defaults to `AWAITING_REVIEW`), with severity, staleness and review count |
+| Case detail | Evidence table · recalculation figures · findings · hypotheses · resolution options · run history |
+| Capabilities notice | A persistent banner when the store is not durable or the identity is self-declared |
 
-Rules:
+The detail screen is read-and-review only. It renders what the API returns and posts back only the four
+review verbs the API accepts: `ACCEPT`, `REJECT`, `REQUEST_MORE_INFO`, `AMEND`. There is no approve
+control, no adjustment control, no execution control, and no button that is disabled *because* money
+cannot move — the controls do not exist at all, so there is nothing to mis-click. `AMEND` requires
+replacement wording and `REJECT` requires a rationale, enforced in the form so a reviewer is not made to
+round-trip a 409 to discover that.
+
+Rules, each of which has a test that fails if it is broken:
+
 - The frontend is a **renderer of server truth**. It never computes an amount, never derives staleness,
-  and never decides whether approval is allowed — it renders what the API returns. A client-side
-  recomputation would be a second, divergent implementation of the money logic.
-- Money is displayed from server strings; the frontend must not do arithmetic on them.
-- Optimistic UI is limited to non-authoritative affordances (disabled buttons). Every state change is
-  confirmed by refetch.
+  and never decides whether a review is allowed. A client-side recomputation would be a second,
+  divergent implementation of the money logic.
+- Money arrives as a string and is formatted as a string (`src/components/money.ts`). ESLint forbids
+  `parseFloat` and `Number(...)` on these paths, because `0.1 + 0.2` is `0.30000000000000004` and
+  `Number("28.40")` prints as `"28.4"` — a reviewer would be shown a figure the system never stored.
+- Grouping digits is allowed; adding, scaling or re-rounding is not. The stored scale is preserved so
+  the display can be reconciled digit-for-digit against an invoice.
+- A difference is rendered without an invented sign. Whether an overcharge is favourable or adverse is a
+  judgement about the dispute, and the formatter does not make it.
+- Stale runs are displayed with the warning and with the review form disabled. The backend refuses the
+  write anyway; the UI should not make a reviewer type a rationale first to find that out.
+- Identity is labelled as self-declared wherever it is used. `X-Actor-Id` is a development label, not
+  authentication, and a reviewer looking at an audit record needs to know that.
+- Optimistic UI is limited to non-authoritative affordances (disabled buttons, submit guards). Every state
+  change is confirmed by refetch, and reviews are append-only so a duplicate submit would be permanent.
 
 ---
 
@@ -800,12 +817,45 @@ Being explicit so this document is not over-read:
 - ✅ Tests: 145 unit (schema declarations, credential redaction, layer boundaries, settings) and 62
   integration (round trip, migration reversibility, every constraint).
 
-**Not built:** the repository layer and session-per-request wiring, the pricing engine, the evidence
-pipeline, LLM adapters, the investigation service, review/adjustment services, and the entire frontend.
+**Phase 2 — evidence, investigation and the AI boundary**
 
-**Not yet verified:** the 62 integration tests have never been executed, because the database role did not
-exist when they were written. The schema is *declared and unit-tested*, not *accepted by PostgreSQL*. See
-`AGENT_USAGE.md` §9.6.
+- ✅ `backend/app/domain/evidence.py` — evidence bundles, fingerprints, and snapshot refusal when a run
+  no longer describes the case.
+- ✅ `backend/app/domain/cases.py` — the `DisputeCase` aggregate: lifecycle, staleness, investigation
+  versions, reviews, `REOPENED` history retention, and the fingerprint check on `with_investigation`.
+- ✅ `backend/app/adapters/llm/` — the provider port, `MockLlmProvider`, response schema with no money
+  fields, and prompt versioning.
+- ✅ `backend/app/services/` — evidence ingestion, investigation orchestration, the deterministic
+  recalculation engine, and the explanation of every figure it produced.
+
+**Phase 3 — review and audit**
+
+- ✅ Append-only reviews with the evidence fingerprint the reviewer actually saw.
+- ✅ Audit event stream written from the same transaction as the state change it describes.
+
+**Phase 4 — case API, persistence and the reviewer workbench**
+
+- ✅ `backend/app/services/cases.py` and `backend/app/api/` — the `/api/v1/disputes` routes, `/health`,
+  `/capabilities`, and a stable error envelope that also covers unmatched routes and 405s.
+- ✅ `backend/app/adapters/persistence/case_models.py` and `backend/migrations/versions/0002_dispute_cases.py`
+  — nine tables, reversible, with the cross-table cycle resolved by `ALTER TABLE`.
+- ✅ `backend/app/adapters/persistence/case_repository.py` (PostgreSQL, optimistic concurrency) and
+  `memory_case_repository.py` (process-local, and reported as such).
+- ✅ `backend/app/domain/json_frozen.py` — deep freeze/thaw so JSON evidence cannot be mutated in place
+  behind the aggregate's back.
+- ✅ `frontend/` — the workbench described in §12.
+- ✅ Tests: 859 passing, 65 skipped, 0 failed. Of the 65 skips, 62 are integration tests that
+  need a reachable PostgreSQL and 3 need real provider SDKs that are not installed. A skip is
+  not a pass: neither group has verified anything.
+
+**Not built, by design:** adjustment execution, approval workflows, idempotency keys, and separation of
+duties. The workbench deliberately exposes no control that would move money, so there is nothing here to
+gate behind them yet.
+
+**Not yet verified:** every PostgreSQL test is skipped, because the development role did not exist when
+they were written. The schema is *declared and unit-tested against the ORM*, and the migration is
+*generated and reversible offline*, but it has not been *accepted by a live PostgreSQL server*. The
+memory store and `MockLlmProvider` paths are the only ones exercised end to end. See `AGENT_USAGE.md` §9.6.
 
 The `Money` value object was built first on purpose: NEP-01 is the principle everything else leans on,
 and it is the one piece where being wrong is silently expensive.

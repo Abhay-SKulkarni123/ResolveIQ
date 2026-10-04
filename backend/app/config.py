@@ -73,6 +73,20 @@ class Settings(BaseSettings):
     llm_temperature: float = 0
     prompt_version: str = "prompt-v1"
 
+    # -- dispute cases -------------------------------------------------------
+    # Where the case repository reads and writes.
+    #
+    # "postgres" is the only value that is durability. "memory" exists so the API
+    # and the reviewer frontend can be exercised with no database running, and it
+    # is an explicit choice rather than a fallback: a service that silently degraded
+    # to an in-process store when the database was unreachable would lose every case
+    # on restart while reporting success, which is the worst of both. It is not a
+    # fallback, and nothing in the startup path may turn it into one.
+    #
+    # Whatever is chosen is reported by GET /api/v1/capabilities, so a caller can
+    # always tell which store answered.
+    case_store: Literal["postgres", "memory"] = "postgres"
+
     # -- investigation -------------------------------------------------------
     investigation_ttl_hours: int = 24
     dispute_description_max_chars: int = 10_000

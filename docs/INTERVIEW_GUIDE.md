@@ -16,32 +16,39 @@ part of this project is *the reasoning*, not the endpoints.
 | `.env.example`, `.gitignore`, `docker-compose.yml`, `Makefile` | Present |
 | `Money` value object + unit tests | **Implemented and verified** |
 | FastAPI app factory + `/api/v1/health` | Implemented, import-verified |
-| Database models, migrations, seed data | **Implemented and verified** (ADR-018…021) |
+| Database models, migrations | **Implemented, unverified against a live server** (ADR-018…021) — declared and unit-tested; no PostgreSQL has ever run them |
 | Pricing engine (recalculation, rules, traces, reconciliation) | **Implemented and verified** (ADR-022) |
 | Evidence model + citation validator + LLM schema | **Implemented and verified** (83 tests) |
 | Impact registry, all 9 hypothesis codes | **Implemented and verified** (54 tests, ADR-023) |
 | `MockLlmProvider` | **Implemented and verified** (32 contract tests) |
 | Investigation service, end to end in memory | **Implemented and verified** (47 tests) |
 | Real LLM provider | **Not built** — port and mock only (OQ-08) |
-| Investigation persistence / resume | **Not built** |
-| Review / adjustment services | **Not built** |
-| `app/api/` beyond health | **Not built** |
-| Frontend | **Not built** (directory only) |
+| Investigation persistence | **Implemented, unverified** — 9 tables, reversible migration; never applied to a live server |
+| Review service | **Implemented and verified** — four verbs, append-only, fingerprint-guarded |
+| `app/api/` beyond health | **Implemented and verified** — `/api/v1/disputes`, `/capabilities`, stable error envelope |
+| Frontend | **Implemented and verified** — reviewer queue + detail, 40 tests, no money-moving control |
 
-Three things are genuinely finished and worth inspecting: the database foundation, the deterministic
-billing engine, and the AI interpretation workflow. `590 passed, 65 skipped`, all offline.
+Four things are genuinely finished and worth inspecting: the deterministic billing engine, the AI
+interpretation workflow, the dispute case API, and the reviewer workbench. The database layer underneath
+them is declared and unit-tested but has never met a live server.
 
-The boundary of that last one matters more than the count. The workflow is real — evidence hashing, the
-closed schema, allowlisted citations, deterministic impact, provenance — but it has no HTTP route, no
-persistence, and no real model behind it. `app/api/` still exposes only the health endpoint. I would
-rather show three things that are correct than ten that are plausible.
+`859 passed, 0 failed, 65 skipped`, all offline. The boundary matters more than the count. The billing
+engine and the money rules are real and need no database. The interpretation workflow is real — evidence
+hashing, the closed schema, allowlisted citations, deterministic impact, provenance — but it has no real
+model behind it. The case API and the workbench are real end to end, against the in-memory store and
+`MockLlmProvider`. Nothing that touches PostgreSQL has been executed, and nothing has been sent to a
+hosted model. I would rather show four things that are correct than ten that are plausible.
 `docs/REQUIREMENTS_TRACEABILITY.md` tracks this per requirement.
 
-One honest caveat on verification: the database work was verified against a real PostgreSQL instance, the
-billing engine is verified by tests that need no database at all, and the interpretation workflow is
-verified only against `MockLlmProvider` — nothing here has been run against a hosted model. The
-integration suite skips in this checkout because no database is reachable, so treat "verified" above as
-scoped to what each suite actually executed.
+One honest caveat on verification, stated precisely because it is the easiest thing to overclaim:
+
+- **The database has never been verified against a live PostgreSQL instance.** The schema is declared,
+  the ORM/migration parity is unit-tested, and the migration compiles to SQL offline, but no `psql` has
+  accepted it. 62 tests are *skipped*, not passing, because no server is reachable.
+- **The interpretation workflow is verified only against `MockLlmProvider`.** Its citation and schema
+  guarantees are structural and hold for any conforming provider, but no hosted model has been called.
+  3 further tests are skipped because the provider SDKs are not installed.
+- **The billing engine needs neither**, so its verification is unconditional.
 
 ---
 
