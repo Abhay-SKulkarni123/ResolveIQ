@@ -93,7 +93,10 @@ export function CaseDetailView({
     return <EmptyState>Loading...</EmptyState>
   }
 
-  const current = detail.investigations.find((run) => run.id === detail.id)
+  // The backend names the live run; it does not make the client re-derive it. The old
+  // lookup compared a run id against the *case* id, which can never be equal, so it
+  // always fell through to "last run wins" and silently mislabelled reopened cases.
+  const current = detail.current_investigation
   const latest = current ?? detail.investigations[detail.investigations.length - 1]
 
   return (
@@ -284,9 +287,7 @@ function RunView({
           <p className="font-medium">This run is degraded.</p>
           <ul className="mt-1 list-disc pl-4">
             {run.degradations.map((degradation) => (
-              <li key={`${degradation.stage}-${degradation.reason}`}>
-                {degradation.stage}: {degradation.reason}
-              </li>
+              <li key={degradation}>{degradation}</li>
             ))}
           </ul>
           <p className="mt-1">

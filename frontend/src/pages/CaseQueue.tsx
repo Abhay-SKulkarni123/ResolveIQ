@@ -6,12 +6,18 @@
  * decision is a list of things to skip past. Staleness is shown per row because a case
  * whose newest run no longer describes its evidence needs a re-run, not a review --
  * different work, and the reviewer should be able to tell them apart at a glance.
+ *
+ * A row shows the outstanding figure and the finding count, because those are the two
+ * things the backend's list response actually carries for triage. It shows no
+ * description: the API omits narratives from the list on purpose, and rendering a
+ * blank line under every case would look like a bug rather than a decision.
  */
 
 import { useCallback, useEffect, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
 import type { CaseList, CaseStatus } from '../api/types'
+import { formatMoney } from '../components/money'
 import { EmptyState, ErrorPanel, StaleBadge, StatusBadge } from '../components/primitives'
 
 const FILTERS: { value: CaseStatus | undefined; label: string }[] = [
@@ -103,13 +109,15 @@ export function CaseQueue({ onSelect }: { onSelect: (caseId: string) => void }) 
                       run v{item.current_investigation_version}
                     </span>
                   )}
-                  {item.review_count > 0 && (
+                  {item.finding_count > 0 && (
                     <span className="text-xs text-ink-faint">
-                      {item.review_count} review{item.review_count === 1 ? '' : 's'}
+                      {item.finding_count} finding{item.finding_count === 1 ? '' : 's'}
                     </span>
                   )}
                 </span>
-                <span className="line-clamp-2 text-sm text-ink-muted">{item.description}</span>
+                <span className="text-sm text-ink-muted">
+                  outstanding {formatMoney(item.outstanding, item.currency)}
+                </span>
                 <span className="text-xs text-ink-faint">
                   invoice <span className="font-mono">{item.invoice_external_id}</span>
                 </span>

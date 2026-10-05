@@ -21,7 +21,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App } from '../App'
 import { ApiError, api } from '../api/client'
-import type { Capabilities, CaseDetail } from '../api/types'
+import type {
+  Capabilities,
+  CaseDetail,
+  CaseSummary,
+  InvestigationResponse,
+} from '../api/types'
 
 const CAPABILITIES: Capabilities = {
   llm_provider: 'mock',
@@ -38,14 +43,21 @@ const CAPABILITIES: Capabilities = {
   features: {},
 }
 
-function investigation(overrides: Partial<CaseDetail['investigations'][number]> = {}) {
+/**
+ * Return type is annotated deliberately: spreading a `Partial<T>` into an object
+ * literal makes every property optional in the inferred type, which then quietly
+ * stops catching missing fields. Naming the type keeps the fixture honest.
+ */
+function investigation(
+  overrides: Partial<InvestigationResponse> = {},
+): InvestigationResponse {
   return {
     id: 'run-1',
-    dispute_id: 'case-1',
     version: 1,
     status: 'COMPLETE',
     evidence_fingerprint: 'sha256:'.concat('a'.repeat(64)),
     is_stale: false,
+    stale_at: null,
     created_at: '2026-03-31T12:00:00Z',
     summary: 'The invoice overstates usage.',
     provider_name: 'mock',
@@ -57,6 +69,8 @@ function investigation(overrides: Partial<CaseDetail['investigations'][number]> 
         natural_key: 'invoice:INV-1',
         evidence_type: 'INVOICE',
         content_hash: 'sha256:' + 'b'.repeat(64),
+        snapshot: { line_items: [] },
+        captured_at: '2026-03-31T12:00:00Z',
       },
     ],
     calculation: {
@@ -70,6 +84,9 @@ function investigation(overrides: Partial<CaseDetail['investigations'][number]> 
       is_provisional: false,
       unresolved_metrics: [],
       trace: { rules: [] },
+      invoice: { invoice_id: 'INV-1' },
+      balance: { total: '5021.86' },
+      usage_summaries: [],
     },
     findings: [
       {
@@ -89,9 +106,9 @@ function investigation(overrides: Partial<CaseDetail['investigations'][number]> 
         id: 'option-1',
         option_type: 'ISSUE_CREDIT',
         title: 'Credit the difference',
-        narrative: '',
         rationale: 'The recalculated total is lower than the invoice.',
         requires_human_approval: true,
+        hypothesis_code: null,
         supporting_evidence: ['invoice:INV-1'],
         reviews: [],
       },
@@ -101,6 +118,14 @@ function investigation(overrides: Partial<CaseDetail['investigations'][number]> 
   }
 }
 
+/**
+ * A `DisputeDetailResponse` exactly as the backend sends it.
+ *
+ * These two factories are deliberately independent. An earlier version derived the
+ * list stub from the detail stub, which quietly forced both to the same shape and so
+ * hid the fact that the list response has no `description` and no `review_count`. Two
+ * different endpoints, two different payloads, two fixtures.
+ */
 function caseDetail(overrides: Partial<CaseDetail> = {}): CaseDetail {
   return {
     id: 'case-1',
@@ -109,43 +134,51 @@ function caseDetail(overrides: Partial<CaseDetail> = {}): CaseDetail {
     contract_external_id: 'CTR-5512',
     status: 'AWAITING_REVIEW',
     severity: 'MEDIUM',
-    description: 'We were billed the wrong rate for API calls.',
-    created_at: '2026-03-31T12:00:00Z',
-    version: 1,
     is_stale: false,
     evidence_fingerprint: 'sha256:' + 'a'.repeat(64),
+    version: 1,
+    created_at: '2026-03-31T12:00:00Z',
+    investigation_count: 1,
     current_investigation_version: 1,
-    review_count: 0,
+    outstanding: '5021.86',
+    currency: 'USD',
+    finding_count: 1,
+    description: 'We were billed the wrong rate for API calls.',
     evidence: [
       {
         natural_key: 'invoice:INV-2026-03-0042',
         evidence_type: 'INVOICE',
         content_hash: 'sha256:' + 'b'.repeat(64),
+        snapshot: { line_items: [] },
+        captured_at: '2026-03-31T12:00:00Z',
       },
     ],
+    current_investigation: investigation(),
     investigations: [investigation()],
     reviews: [],
-    source_document: {},
     ...overrides,
   }
 }
 
-function caseSummary(overrides: Partial<CaseDetail> = {}) {
-  const detail = caseDetail(overrides)
+/** A `CaseSummaryResponse` exactly as the backend sends it -- no narrative, no reviews. */
+function caseSummary(overrides: Partial<CaseSummary> = {}): CaseSummary {
   return {
-    id: detail.id,
-    external_id: detail.external_id,
-    invoice_external_id: detail.invoice_external_id,
-    contract_external_id: detail.contract_external_id,
-    status: detail.status,
-    severity: detail.severity,
-    description: detail.description,
-    created_at: detail.created_at,
-    version: detail.version,
-    is_stale: detail.is_stale,
-    evidence_fingerprint: detail.evidence_fingerprint,
-    current_investigation_version: detail.current_investigation_version,
-    review_count: detail.reviews.length,
+    id: 'case-1',
+    external_id: 'DSC-000123',
+    invoice_external_id: 'INV-2026-03-0042',
+    contract_external_id: 'CTR-5512',
+    status: 'AWAITING_REVIEW',
+    severity: 'MEDIUM',
+    is_stale: false,
+    evidence_fingerprint: 'sha256:' + 'a'.repeat(64),
+    version: 1,
+    created_at: '2026-03-31T12:00:00Z',
+    investigation_count: 1,
+    current_investigation_version: 1,
+    outstanding: '5021.86',
+    currency: 'USD',
+    finding_count: 1,
+    ...overrides,
   }
 }
 
@@ -280,24 +313,30 @@ describe('the case detail view', () => {
   })
 
   it('shows a provisional calculation as provisional', async () => {
+    // `current_investigation` and `investigations[last]` are the same run, which is
+    // what the server sends; the view trusts the former, so a fixture that sets only
+    // the latter would be describing a response the backend never produces.
+    const run = investigation({
+      calculation: {
+        currency: 'USD',
+        engine_version: '1.0.0',
+        recorded_total: '28.40',
+        recalculated_total: '5000.00',
+        difference: '4971.60',
+        is_complete: false,
+        is_provisional: true,
+        unresolved_metrics: ['api_calls'],
+        trace: {},
+        invoice: { invoice_id: 'INV-2026-03-0042' },
+        balance: { total: '5000.00' },
+        usage_summaries: [],
+      },
+    })
     stubApi({
       getCase: vi.fn().mockResolvedValue(
         caseDetail({
-          investigations: [
-            investigation({
-              calculation: {
-                currency: 'USD',
-                engine_version: '1.0.0',
-                recorded_total: '28.40',
-                recalculated_total: '5000.00',
-                difference: '4971.60',
-                is_complete: false,
-                is_provisional: true,
-                unresolved_metrics: ['api_calls'],
-                trace: {},
-              },
-            }),
-          ],
+          investigations: [run],
+          current_investigation: run,
         }),
       ),
     })
@@ -339,12 +378,14 @@ describe('the case detail view', () => {
   it('refuses to let a stale finding be reviewed', async () => {
     // The UI must not offer the action, because the backend will refuse it and a
     // reviewer who typed a rationale first deserves better than a 409.
+    const staleRun = investigation({ is_stale: true })
     stubApi({
       getCase: vi.fn().mockResolvedValue(
         caseDetail({
           is_stale: true,
           status: 'REOPENED',
-          investigations: [investigation({ is_stale: true })],
+          investigations: [staleRun],
+          current_investigation: staleRun,
         }),
       ),
     })

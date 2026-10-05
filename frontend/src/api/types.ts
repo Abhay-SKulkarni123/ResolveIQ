@@ -24,7 +24,9 @@ export interface EvidenceResponse {
   natural_key: string
   evidence_type: string
   content_hash: string
-  snapshot?: Record<string, unknown>
+  /** Always sent; an evidence row with no snapshot would be unreadable. */
+  snapshot: Record<string, unknown>
+  captured_at: string | null
 }
 
 export interface ReviewResponse {
@@ -38,6 +40,12 @@ export interface ReviewResponse {
   rationale: string
   amended_narrative?: string | null
   evidence_fingerprint_seen: string
+  /**
+   * The backend's own flag for "this review was recorded against evidence that has
+   * since changed". It is the server's judgement, so the UI shows it rather than
+   * re-deriving staleness from the fingerprint.
+   */
+  is_against_current_evidence: boolean
   created_at: string
 }
 
@@ -47,9 +55,9 @@ export interface FindingResponse {
   severity: string
   category: string
   narrative: string
-  confidence: AmountText | null
+  /** Always present on a finding, and still text: it is a ratio, not money. */
+  confidence: AmountText
   supporting_evidence: string[]
-  refuting_evidence?: string[]
   reviews: ReviewResponse[]
 }
 
@@ -62,6 +70,9 @@ export interface HypothesisResponse {
   likelihood: AmountText | null
   metric_key: string | null
   impact: MoneyResponse
+  /** Why the impact figure is what it is. `null` when it could not be established. */
+  impact_basis: string | null
+  impact_trace: Record<string, unknown>
   supporting_evidence: string[]
   refuting_evidence: string[]
   reviews: ReviewResponse[]
@@ -71,9 +82,10 @@ export interface ResolutionOptionResponse {
   id: string
   option_type: string
   title: string
-  narrative: string
   rationale: string
   requires_human_approval: boolean
+  /** The hypothesis this option answers, when it answers one. */
+  hypothesis_code: string | null
   supporting_evidence: string[]
   reviews: ReviewResponse[]
 }
@@ -81,29 +93,39 @@ export interface ResolutionOptionResponse {
 export interface CalculationResponse {
   currency: string
   engine_version: string
-  recorded_total: AmountText
+  recorded_total: AmountText | null
   recalculated_total: AmountText
   difference?: AmountText | null
   outstanding?: AmountText | null
   net_adjustments?: AmountText | null
+  allocated_payments?: AmountText | null
+  /** The invoice as submitted, echoed back so a figure can be traced to its source. */
+  invoice: Record<string, unknown>
+  balance: Record<string, unknown>
+  usage_summaries: Record<string, unknown>[]
   is_complete: boolean
   is_provisional: boolean
   unresolved_metrics: string[]
   trace: Record<string, unknown>
 }
 
-export interface Degradation {
-  stage: string
-  reason: string
-}
+/**
+ * A degradation notice.
+ *
+ * The backend models these as bare reason strings, not objects, so this is a string
+ * and not a `{ stage, reason }` pair. It was once typed as an object here, which made
+ * the UI render `undefined: undefined` for every degraded run it was ever shown.
+ */
+export type Degradation = string
 
 export interface InvestigationResponse {
   id: string
-  dispute_id: string
   version: number
   status: string
   evidence_fingerprint: string
   is_stale: boolean
+  /** When the run was superseded, if it was. */
+  stale_at: string | null
   created_at: string
   summary: string
   provider_name: string
@@ -126,6 +148,18 @@ export type CaseStatus =
   | 'RESOLVED'
   | 'REJECTED'
 
+/**
+ * One row of the dispute list -- mirrors the backend's `CaseSummaryResponse`.
+ *
+ * The backend deliberately omits narratives here (it says so in the schema docstring):
+ * a list of fifty cases must not drag fifty prose blobs across the wire. So there is
+ * no `description` on this type, and no `review_count` either -- the list carries the
+ * counts a reviewer triages on (`investigation_count`, `finding_count`) and nothing
+ * more. If you need a narrative, fetch the detail.
+ *
+ * `src/test/contract.test.ts` fails the build if this drifts from the live OpenAPI
+ * schema, so these fields are not a matter of opinion.
+ */
 export interface CaseSummary {
   id: string
   external_id: string
@@ -133,20 +167,32 @@ export interface CaseSummary {
   contract_external_id: string | null
   status: CaseStatus
   severity: string
-  description: string
-  created_at: string
-  version: number
   is_stale: boolean
   evidence_fingerprint: string
+  version: number
+  created_at: string
+  investigation_count: number
   current_investigation_version: number | null
-  review_count: number
+  /** String money. `null` means "not assessable", which is not the same as zero. */
+  outstanding: AmountText | null
+  currency: string | null
+  finding_count: number
 }
 
+/** One dispute in full -- mirrors the backend's `DisputeDetailResponse`. */
 export interface CaseDetail extends CaseSummary {
+  /** Present on the detail only. The list omits narratives by design. */
+  description: string
   evidence: EvidenceResponse[]
+  /**
+   * The run the backend considers current. Prefer this over guessing from
+   * `investigations`: it is the server's answer to "which run is live", and a
+   * client that recomputes it can disagree.
+   */
+  current_investigation: InvestigationResponse | null
+  /** Every run, newest last. */
   investigations: InvestigationResponse[]
   reviews: ReviewResponse[]
-  source_document: Record<string, unknown>
 }
 
 export interface CaseList {
