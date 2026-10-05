@@ -17,6 +17,7 @@ WORKDIR /app
 
 # libpq is needed by psycopg (binary wheel is used, but keep the client available
 # for debugging); build tools are not installed because we use binary wheels.
+# PyMySQL is pure Python, so the MySQL driver needs no client library at all.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libpq5 curl \
     && rm -rf /var/lib/apt/lists/*
@@ -36,9 +37,10 @@ RUN pip install --upgrade pip setuptools wheel \
 
 COPY app ./app
 COPY scripts ./scripts
-# alembic.ini is added in Phase 1 together with the first SQLAlchemy model and
-# the initial migration. It is intentionally not copied yet: a migration runner
-# with no models would be scaffolding for its own sake.
+# Alembic needs its config and migration scripts inside the image; without these
+# the documented deploy step (`alembic upgrade head`) cannot run in the container.
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 
 # Run as a non-root user. A billing service should not be root in its container.
 RUN useradd --create-home --uid 1000 resolveiq \

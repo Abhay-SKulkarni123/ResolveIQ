@@ -4,8 +4,10 @@
 #
 # Services:
 #   db    PostgreSQL 16 (dev credentials only — see .env.example)
+#          MySQL 8 is also supported; see README §Known limitations.
 #   api   FastAPI backend, hot-reloading, migrations applied on start
-#   web   Vite dev server for the React frontend
+#   web       Vite dev server for the React frontend (hot reload)
+#   web-prod  nginx serving the built bundle (closer to production)
 #
 # SECURITY: only the `api` service receives LLM_* and POSTGRES_* variables.
 # The `web` service receives no secrets, and no VITE_* secret may ever be added
@@ -50,11 +52,14 @@ services:
       db:
         condition: service_healthy
     # NOTE: `alembic upgrade head` is deliberately NOT run on start.
-    # The first migration now exists (backend/migrations/versions/0001_initial_schema.py),
-    # but this file could not be exercised in the environment where it was written,
-    # because no Docker daemon was available. Rather than ship an unverified start
-    # command, migrations are run explicitly:  cd backend && alembic upgrade head
-    # Wire it in once the container path has actually been observed to work.
+    # Two migrations now exist and the backend image copies alembic.ini and
+    # migrations/, but this Compose path has never been executed (no Docker daemon
+    # was available in the environment where it was written). Rather than ship an
+    # unverified start command, migrations are run explicitly and separately:
+    #   docker compose run --rm api alembic upgrade head
+    #   docker compose up -d db api web
+    # Wire the migration into the start command once the container path has been
+    # observed to work, and prefer running it as its own release step.
     command: >
       sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     healthcheck:
@@ -64,12 +69,11 @@ services:
       retries: 5
       start_period: 20s
 
+  # `npm run dev` with hot reload, for day-to-day frontend work. Use the
+  # `web-prod` service below when you want the built bundle served by nginx.
   web:
     image: node:22-alpine
     working_dir: /app
-    environment:
-      # Not a secret. The API base URL is public by definition.
-      VITE_API_BASE_URL: http://localhost:8000/api/v1
     ports:
       - "5173:5173"
     volumes:
@@ -77,13 +81,22 @@ services:
       - /app/node_modules
     depends_on:
       - api
-    # `npm install` runs on first start; node_modules is a named volume so the
-    # container's Linux binaries are not shadowed by the host's Windows ones.
-    #
-    # NOT YET USABLE: frontend/package.json does not exist (Phase 4). Until then
-    # start only the services that exist:  docker compose up db api
+    # node_modules is a named volume so the container's Linux binaries are not
+    # shadowed by the host's Windows ones.
     command: >
       sh -c "npm install && npm run dev -- --host 0.0.0.0"
+
+  # Production-style frontend: the built bundle served by nginx, which also
+  # forwards /api to the api service (see frontend/nginx.conf). The app itself
+  # needs no API host setting: src/api/client.ts requests a relative /api/v1.
+  web-prod:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
 
 volumes:
   pgdata:

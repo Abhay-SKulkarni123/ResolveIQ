@@ -26,13 +26,13 @@ part of this project is *the reasoning*, not the endpoints.
 | Investigation persistence | **Implemented, unverified** — 9 tables, reversible migration; never applied to a live server |
 | Review service | **Implemented and verified** — four verbs, append-only, fingerprint-guarded |
 | `app/api/` beyond health | **Implemented and verified** — `/api/v1/disputes`, `/capabilities`, stable error envelope |
-| Frontend | **Implemented and verified** — reviewer queue + detail, 40 tests, no money-moving control |
+| Frontend | **Implemented and verified** — reviewer queue + detail, 53 tests, no money-moving control |
 
 Four things are genuinely finished and worth inspecting: the deterministic billing engine, the AI
 interpretation workflow, the dispute case API, and the reviewer workbench. The database layer underneath
 them is declared and unit-tested but has never met a live server.
 
-`859 passed, 0 failed, 65 skipped`, all offline. The boundary matters more than the count. The billing
+`831 passed, 0 failed` in the unit suite, offline. The 62 database integration tests do run now, against MySQL — **42 pass, 20 fail** on PostgreSQL-specific catalog assumptions (ADR-027). The boundary matters more than the count. The billing
 engine and the money rules are real and need no database. The interpretation workflow is real — evidence
 hashing, the closed schema, allowlisted citations, deterministic impact, provenance — but it has no real
 model behind it. The case API and the workbench are real end to end, against the in-memory store and

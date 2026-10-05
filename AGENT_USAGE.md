@@ -460,10 +460,11 @@ test for an adapter must import the adapter. I changed the rule to assert agains
 the one place in this phase where I edited a rule instead of following it. I believe the edit is correct
 and I would rather it be visible and challengeable than done quietly.
 
-**Removed `Settings.is_sqlite`.** It was dead in Phase 0, and ADR-014 says PostgreSQL only. Rather than
-leave a property implying a supported SQLite path, `create_engine_for_url` now refuses a non-PostgreSQL URL
-with a message citing ADR-014. A `sqlite://` URL would otherwise have built a working engine and then
-misbehaved on `JSONB`, native `uuid` and `timestamptz`.
+**Removed `Settings.is_sqlite`.** It was dead in Phase 0, and ADR-014 originally scoped the backend to
+PostgreSQL. Rather than leave a property implying a supported SQLite path, `create_engine_for_url` refuses
+URLs for backends outside the supported set, with a message citing ADR-014. A `sqlite://` URL would
+otherwise have built a working engine and then misbehaved on `JSONB`, native `uuid` and `timestamptz`.
+That set later widened to include MySQL — see ADR-027 and §MySQL portability below.
 
 ### 9.6 What is verified and what is not
 
@@ -478,10 +479,12 @@ Verified by running it:
 - `ruff check`, `ruff format --check` and strict `mypy app` are all clean.
 - The 59 Phase 0 tests still pass, including the health endpoint.
 
-**Not verified, and not claimed:** 62 integration tests are written and currently *skip*, because the
-`resolveiq` role and its two databases do not exist yet. `backend/scripts/create_dev_database.sql` creates
-them and is idempotent. Until an administrator runs it, this schema has never been accepted by PostgreSQL,
-and no statement in this repository should be read as saying otherwise. The traceability matrix says so
+**Superseded by later work.** At the time of writing, 62 integration tests were written but *skipped*,
+because the `resolveiq` role and its two databases did not exist. That is no longer the situation: a live
+MySQL 8.0.43 server has since been provisioned, `alembic upgrade head` has been run against it from a
+clean database, and the suite now *executes* — 42 passed, 20 failed of 62. See §MySQL portability below
+and README §20. The 20 failures are PostgreSQL-catalog and dialect-expectation assumptions in the test
+harness; they are not proven harmless and are not reported as passing.
 too, rather than ticking STK-03 as done.
 
 **Also unverified:** `docker-compose.yml`. The obvious change was to add `alembic upgrade head` to the API

@@ -895,3 +895,52 @@ Tracked in full in `REQUIREMENTS_TRACEABILITY.md` §7. Condensed here with the d
 **Highest-risk assumption:** OQ-01. If a reviewer reads dev-mode header auth as "authentication
 implemented", that is a misrepresentation. It is called out in `SYSTEM_DESIGN.md` §11.2, in the README,
 and here for exactly that reason.
+
+## ADR-027 — MySQL 8 supported alongside PostgreSQL, via dialect-portable types only
+
+**Status:** Accepted
+
+**Context.** The backend was originally scoped to PostgreSQL alone (ADR-014). The assessment environment
+provided MySQL 8.0.43 rather than PostgreSQL, so the persistence layer had to run there without a rewrite.
+The question was how to widen the supported set without weakening the constraints the billing domain
+depends on.
+
+**Decision.** Keep PostgreSQL as the reference and add MySQL through dialect-portable SQLAlchemy types,
+with dialect branching confined to the two places where the engines genuinely have no common spelling:
+
+1. **JSON** — generic `JSON` carrying a `with_variant(postgresql.JSONB, "postgresql")`, so PostgreSQL keeps
+   JSONB and its indexing guarantees while MySQL gets native `JSON`. One declaration, no per-dialect
+   branches in the models.
+2. **Idempotent evidence insert** — `ON CONFLICT DO NOTHING` on PostgreSQL, `ON DUPLICATE KEY UPDATE`
+   with each unique-index column assigned to itself on MySQL. `INSERT IGNORE` was rejected: it also
+   suppresses unrelated errors, which is the opposite of what an evidence-integrity write path wants.
+3. **CHECK constraints** — `btrim` became `TRIM`. PostgreSQL's `~` regex operator has no MySQL equivalent
+   and MySQL forbids regex inside CHECK altogether, so the ISO-4217 and SHA-256 checks were rewritten as
+   `CHAR_LENGTH` / `ASCII(SUBSTRING(...))` / nested `REPLACE` expressions in a shared
+   `app/adapters/persistence/ddl.py`. Both engines build the same expressions from one module so models and
+   migrations cannot drift.
+
+**Two traps worth recording.** First, MySQL's default `utf8mb4_0900_ai_ci` collation is case-insensitive,
+so the naive translation `currency = 'USD'` would have accepted `usd`. Every character comparison is
+therefore routed through `ASCII`, which is collation-independent. Second, MySQL rejects several otherwise
+innocent functions inside CHECK constraints — `TRANSLATE` fails with error 3814 — so the hex-character test
+uses nested `REPLACE` instead.
+
+**Consequences.**
+- Money precision is unaffected: `NUMERIC(19,4)` and `DECIMAL(19,4)` are the same storage.
+- Three genuine behavioural differences remain and are documented rather than papered over: MySQL has no
+  JSONB, identifiers are `CHAR(32)` rather than native `uuid`, and `DATETIME` does not store a timezone
+  offset where `timestamptz` does. The last one is a real semantic gap, not cosmetic.
+- **20 integration tests still fail** on MySQL. They encode PostgreSQL catalog queries (`pg_constraint`,
+  `pg_attribute`, a `public` schema) and physical-type assumptions, and MySQL labels a CHECK violation as
+  `OperationalError` where PostgreSQL raises `IntegrityError`. None were weakened or deleted to make the
+  suite green; loosening an assertion that encodes real PostgreSQL behaviour would hide a genuine gap, so
+  each needs a deliberate decision instead.
+
+**Alternatives rejected.**
+- *Dual code paths per repository method* — the divergence is genuinely two spellings wide; branching
+  anywhere else would be speculative generality.
+- *Dropping the regex constraints on MySQL and validating in the application layer* — moves a database
+  invariant to application code, so a fix, report, or `psql` session can write around it.
+- *MySQL-native `UUID_TO_BIN` / `BIN_TO_UUID` functions* — 8.0 adds these, but they are MySQL-only and would
+  have reintroduced exactly the branching this ADR avoids.
