@@ -13,7 +13,12 @@ from alembic import command
 from sqlalchemy import text
 
 from app.adapters.persistence import Base
-from tests.integration.conftest import MANAGED_TABLES, constraint_names, table_names
+from tests.integration.conftest import (
+    MANAGED_TABLES,
+    MYSQL_PRIMARY_KEY_NAME,
+    constraint_names,
+    table_names,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -160,6 +165,21 @@ def test_columns_match_the_models(alembic_config, engine, table_name: str) -> No
 
 
 @pytest.mark.parametrize("table_name", sorted(EXPECTED_CONSTRAINTS))
+def expected_for(connection: object, table_name: str) -> set[str]:
+    """Return the declared constraint names for ``table_name`` on this engine.
+
+    Identical to :data:`EXPECTED_CONSTRAINTS` except on MySQL, which reserves the
+    name ``PRIMARY`` for a table's primary key and discards the ``pk_<table>`` name
+    the migration supplies. Every other name must still match exactly, so the
+    double-prefixing and truncation this test guards against stay covered.
+    """
+    names = set(EXPECTED_CONSTRAINTS[table_name])
+    if connection.engine.dialect.name == "mysql":  # type: ignore[attr-defined]
+        names.discard(f"pk_{table_name}")
+        names.add(MYSQL_PRIMARY_KEY_NAME)
+    return names
+
+
 def test_constraint_names_are_exactly_as_declared(alembic_config, engine, table_name: str) -> None:
     """Named constraints can be asserted on, which is the point of naming them.
 
@@ -169,7 +189,7 @@ def test_constraint_names_are_exactly_as_declared(alembic_config, engine, table_
     """
     command.upgrade(alembic_config, "head")
     with engine.connect() as connection:
-        assert constraint_names(connection, table_name) == EXPECTED_CONSTRAINTS[table_name]
+        assert constraint_names(connection, table_name) == expected_for(connection, table_name)
     command.downgrade(alembic_config, "base")
 
 

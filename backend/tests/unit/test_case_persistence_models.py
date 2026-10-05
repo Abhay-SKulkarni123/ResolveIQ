@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 from sqlalchemy import CheckConstraint, Float, Integer, Numeric, UniqueConstraint
 
+import app.adapters.persistence.ddl as ddl
 from app.adapters.persistence import MONEY_PRECISION, MONEY_SCALE, Base
 from app.adapters.persistence.case_models import (
     DisputeEvidenceRow,
@@ -86,6 +87,22 @@ def migration_source() -> str:
 # ---------------------------------------------------------------------------
 # Metadata completeness
 # ---------------------------------------------------------------------------
+
+
+
+def _renders_as(column, backend: str, type_name: str) -> bool:
+    """Report the concrete DDL type ``column`` compiles to for ``backend``.
+
+    A generic JSON type carrying a PostgreSQL variant reports two different types
+    depending on the dialect, so asserting on the declared Python type alone would
+    pass even if the variant mapping were dropped.
+    """
+    from sqlalchemy.dialects import mysql, postgresql
+
+    dialects = {"postgresql": postgresql.dialect(), "mysql": mysql.dialect()}
+    rendered = str(column.type.compile(dialect=dialects[backend]))
+    return type_name in rendered
+
 
 
 def test_importing_the_package_registers_every_phase4_table() -> None:
@@ -191,20 +208,24 @@ def test_no_phase4_column_uses_a_floating_point_type() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_evidence_snapshot_is_jsonb_and_required() -> None:
+def test_evidence_snapshot_is_json_and_required() -> None:
     """The snapshot is the citable fact, so it cannot be absent.
+
+    The column is a generic JSON carrying a PostgreSQL JSONB variant, so it stays
+    JSONB on the reference backend and becomes native JSON on MySQL.
 
     An evidence row with a hash and no snapshot would be a fingerprint of nothing:
     a reviewer could not be shown what was hashed, and a staleness comparison would
     be attesting to an empty document.
     """
     snapshot = DisputeEvidenceRow.__table__.columns["snapshot"]
-    assert snapshot.type.__class__.__name__ == "JSONB"
+    assert _renders_as(snapshot, "postgresql", "JSONB")
+    assert _renders_as(snapshot, "mysql", "JSON")
     assert snapshot.nullable is False
 
 
-def test_source_document_is_required_jsonb() -> None:
-    """JSONB, and NOT NULL.
+def test_source_document_is_required_json() -> None:
+    """JSON, and NOT NULL.
 
     Required rather than nullable: every case is opened from an ingest payload, so
     a row with no payload would be a case that cannot be re-investigated. The
@@ -213,7 +234,8 @@ def test_source_document_is_required_jsonb() -> None:
     different thing from a NULL the domain cannot interpret.
     """
     column = DisputeRow.__table__.columns["source_document"]
-    assert column.type.__class__.__name__ == "JSONB"
+    assert _renders_as(column, "postgresql", "JSONB")
+    assert _renders_as(column, "mysql", "JSON")
     assert column.nullable is False
 
 
@@ -324,8 +346,8 @@ def test_a_hypothesis_without_an_amount_must_be_explained() -> None:
     """
     sql = _check_sql("investigation_hypotheses")
     assert "missing_impact_is_explained" not in sql  # the name is prefixed by convention
-    assert "COALESCE(BTRIM(impact_basis), '') <> ''" in sql
-    assert "COALESCE(BTRIM(not_assessable_reason), '') <> ''" in sql
+    assert "COALESCE(TRIM(impact_basis), '') <> ''" in sql
+    assert "COALESCE(TRIM(not_assessable_reason), '') <> ''" in sql
 
 
 def _migration_check_sql(table_name: str, bare_name: str) -> str:
@@ -380,7 +402,7 @@ def test_the_impact_constraints_allow_a_directional_hypothesis() -> None:
     assert "not_assessable_reason IS NULL" not in constraint
     # The sibling amount-implies-basis clause is what stops the OR from being a
     # loophole: a present amount still has to say where it came from.
-    assert "impact_amount IS NULL OR COALESCE(BTRIM(impact_basis), '') <> ''" in sql
+    assert "impact_amount IS NULL OR COALESCE(TRIM(impact_basis), '') <> ''" in sql
     # And the migration has to agree with the ORM, or the two drift apart silently.
     migrated = _migration_check_sql("investigation_hypotheses", "missing_impact_is_explained")
     assert migrated == constraint
@@ -398,7 +420,7 @@ def test_an_amount_requires_a_basis_and_excludes_an_unassessable_reason() -> Non
         if isinstance(c, CheckConstraint)
     }
     assert any(
-        "impact_amount IS NULL OR COALESCE(BTRIM(impact_basis), '') <> ''" in sql
+        "impact_amount IS NULL OR COALESCE(TRIM(impact_basis), '') <> ''" in sql
         and "amount_implies_basis" in (name or "")
         for name, sql in constraints.items()
     )
@@ -503,7 +525,15 @@ def _declared_checks(path: Path) -> list[tuple[str, str]]:
     # ``f"status IN ({_CASE_STATUSES})"`` so that adding a state to the domain enum
     # widens the constraint automatically. That is the behaviour worth keeping, and
     # it must not be the reason this comparison silently skips five constraints.
-    module_namespace: dict[str, Any] = {}
+    # Seed with the shared constraint builders so a constraint written as
+    # ``is_sha256_fingerprint("col")`` resolves to the SQL it produces, exactly
+    # as the interpreter would when the module is imported.
+    module_namespace: dict[str, Any] = {
+        "not_blank": ddl.not_blank,
+        "is_iso4217_currency": ddl.is_iso4217_currency,
+        "is_sha256_fingerprint": ddl.is_sha256_fingerprint,
+        "nullable": ddl.nullable,
+    }
     for statement in tree.body:
         # Both forms appear: ``X = ...`` and ``X: Final[str] = ...``.
         if isinstance(statement, ast.AnnAssign):
@@ -569,6 +599,23 @@ def _static_string(node: ast.expr, namespace: dict[str, Any]) -> str | None:
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    # A call to one of the shared constraint builders in
+    # ``app.adapters.persistence.ddl``. These are pure functions of a column name,
+    # so evaluating the call yields the same SQL the database will be given, which
+    # is what this comparison needs to see.
+    if isinstance(node, ast.Call):
+        name = getattr(node.func, "id", "")
+        builder = namespace.get(name)
+        if callable(builder):
+            args = [
+                ast.literal_eval(argument)
+                if isinstance(argument, ast.Constant)
+                else _static_string(argument, namespace)  # nested builder call
+                for argument in node.args
+            ]
+            if all(isinstance(argument, str) for argument in args):
+                return builder(*args)
+        return None
     if not isinstance(node, ast.JoinedStr):
         return None
     parts: list[str] = []

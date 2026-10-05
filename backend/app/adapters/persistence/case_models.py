@@ -104,6 +104,7 @@ from decimal import Decimal
 from typing import Any, Final
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -121,6 +122,11 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.adapters.persistence.base import Base, UuidPrimaryKeyMixin
+from app.adapters.persistence.ddl import (
+    is_iso4217_currency,
+    is_sha256_fingerprint,
+    nullable,
+)
 
 __all__ = [
     "NUMERIC_MONEY",
@@ -156,7 +162,12 @@ _REVIEW_TARGETS: Final[str] = "'FINDING','HYPOTHESIS','RESOLUTION_OPTION'"
 #: is indexable and comparable while ``json`` is opaque text. It also round-trips
 #: numbers without the trailing-zero loss that makes a content hash computed on
 #: read differ from the one computed on write.
-JSONB: Final[Any] = postgresql.JSONB(astext_type=Text())
+#:
+#: MySQL has no JSONB, so this is the generic ``JSON`` type carrying a PostgreSQL
+#: variant: PostgreSQL still gets JSONB and its indexing guarantees, and MySQL gets
+#: its native ``JSON`` column. One declaration, no per-dialect branches in the
+#: models, and the same Python-side dict round-trip either way.
+JSONB: Final[Any] = JSON().with_variant(postgresql.JSONB(), "postgresql")
 
 
 class DisputeRow(UuidPrimaryKeyMixin, Base):
@@ -220,13 +231,13 @@ class DisputeRow(UuidPrimaryKeyMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("external_id", name="uq_disputes_external_id"),
-        CheckConstraint("btrim(external_id) <> ''", name="external_id_not_blank"),
-        CheckConstraint("btrim(invoice_external_id) <> ''", name="invoice_external_id_not_blank"),
+        CheckConstraint("TRIM(external_id) <> ''", name="external_id_not_blank"),
+        CheckConstraint("TRIM(invoice_external_id) <> ''", name="invoice_external_id_not_blank"),
         CheckConstraint(f"status IN ({_CASE_STATUSES})", name="status_is_known"),
         CheckConstraint(f"severity IN ({_CASE_SEVERITIES})", name="severity_is_known"),
         CheckConstraint("version >= 1", name="version_is_positive"),
         CheckConstraint(
-            "evidence_fingerprint ~ '^sha256:[0-9a-f]{64}$'", name="fingerprint_is_sha256"
+            is_sha256_fingerprint("evidence_fingerprint"), name="fingerprint_is_sha256"
         ),
         Index("ix_disputes_status_created_at", "status", "created_at"),
         Index("ix_disputes_invoice_external_id", "invoice_external_id"),
@@ -269,9 +280,9 @@ class DisputeEvidenceRow(UuidPrimaryKeyMixin, Base):
             "content_hash",
             name="uq_dispute_evidence_items_dispute_id_natural_key_content_hash",
         ),
-        CheckConstraint("btrim(natural_key) <> ''", name="natural_key_not_blank"),
+        CheckConstraint("TRIM(natural_key) <> ''", name="natural_key_not_blank"),
         CheckConstraint(
-            "content_hash ~ '^sha256:[0-9a-f]{64}$'", name="content_hash_is_sha256"
+            is_sha256_fingerprint("content_hash"), name="content_hash_is_sha256"
         ),
         Index("ix_dispute_evidence_items_dispute_id", "dispute_id"),
         Index("ix_dispute_evidence_items_natural_key", "natural_key"),
@@ -329,7 +340,7 @@ class CalculationRow(UuidPrimaryKeyMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("investigation_id", name="uq_calculations_investigation_id"),
-        CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_is_iso4217"),
+        CheckConstraint(is_iso4217_currency("currency"), name="currency_is_iso4217"),
         CheckConstraint(
             "NOT is_provisional OR is_complete = false",
             name="provisional_totals_are_incomplete",
@@ -381,7 +392,7 @@ class InvestigationRow(UuidPrimaryKeyMixin, Base):
         CheckConstraint("version >= 1", name="version_is_positive"),
         CheckConstraint(f"status IN ({_RUN_STATUSES})", name="status_is_known"),
         CheckConstraint(
-            "evidence_fingerprint ~ '^sha256:[0-9a-f]{64}$'", name="fingerprint_is_sha256"
+            is_sha256_fingerprint("evidence_fingerprint"), name="fingerprint_is_sha256"
         ),
         Index("ix_investigations_dispute_id", "dispute_id"),
         Index("ix_investigations_stale_at", "stale_at"),
@@ -438,7 +449,7 @@ class InvestigationFindingRow(UuidPrimaryKeyMixin, Base):
     __table_args__ = (
         CheckConstraint("severity IN ('INFO','WARN','CRITICAL')", name="severity_is_known"),
         CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_in_unit_range"),
-        CheckConstraint("btrim(narrative) <> ''", name="narrative_not_blank"),
+        CheckConstraint("TRIM(narrative) <> ''", name="narrative_not_blank"),
         Index("ix_investigation_findings_investigation_id", "investigation_id"),
     )
 
@@ -490,12 +501,12 @@ class InvestigationHypothesisRow(UuidPrimaryKeyMixin, Base):
         # repository reject rows the domain considers valid.
         CheckConstraint(
             "impact_amount IS NOT NULL "
-            "OR COALESCE(BTRIM(impact_basis), '') <> '' "
-            "OR COALESCE(BTRIM(not_assessable_reason), '') <> ''",
+            "OR COALESCE(TRIM(impact_basis), '') <> '' "
+            "OR COALESCE(TRIM(not_assessable_reason), '') <> ''",
             name="missing_impact_is_explained",
         ),
         CheckConstraint(
-            "impact_amount IS NULL OR COALESCE(BTRIM(impact_basis), '') <> ''",
+            "impact_amount IS NULL OR COALESCE(TRIM(impact_basis), '') <> ''",
             name="amount_implies_basis",
         ),
         CheckConstraint(
@@ -507,7 +518,7 @@ class InvestigationHypothesisRow(UuidPrimaryKeyMixin, Base):
             name="amount_implies_currency",
         ),
         CheckConstraint(
-            "impact_currency IS NULL OR impact_currency ~ '^[A-Z]{3}$'",
+            nullable("impact_currency", is_iso4217_currency("impact_currency")),
             name="currency_is_iso4217",
         ),
         CheckConstraint(
@@ -552,7 +563,7 @@ class InvestigationResolutionOptionRow(UuidPrimaryKeyMixin, Base):
 
     __table_args__ = (
         CheckConstraint(
-            "btrim(rationale) <> ''", name="rationale_not_blank"
+            "TRIM(rationale) <> ''", name="rationale_not_blank"
         ),
         Index("ix_investigation_resolution_options_investigation_id", "investigation_id"),
     )
@@ -602,17 +613,17 @@ class FindingReviewRow(UuidPrimaryKeyMixin, Base):
     __table_args__ = (
         CheckConstraint(f"action IN ({_REVIEW_ACTIONS})", name="action_is_known"),
         CheckConstraint(f"target_type IN ({_REVIEW_TARGETS})", name="target_type_is_known"),
-        CheckConstraint("btrim(actor_id) <> ''", name="actor_id_not_blank"),
+        CheckConstraint("TRIM(actor_id) <> ''", name="actor_id_not_blank"),
         CheckConstraint(
             "(action = 'AMEND') = (amended_narrative IS NOT NULL)",
             name="amendment_matches_action",
         ),
         CheckConstraint(
-            "amended_narrative IS NULL OR btrim(amended_narrative) <> ''",
+            "amended_narrative IS NULL OR TRIM(amended_narrative) <> ''",
             name="amendment_not_blank",
         ),
         CheckConstraint(
-            "evidence_fingerprint_seen ~ '^sha256:[0-9a-f]{64}$'",
+            is_sha256_fingerprint("evidence_fingerprint_seen"),
             name="fingerprint_is_sha256",
         ),
         Index("ix_finding_reviews_dispute_id_created_at", "dispute_id", "created_at"),

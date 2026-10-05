@@ -32,6 +32,11 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
+from app.adapters.persistence.ddl import (
+    is_iso4217_currency,
+    is_sha256_fingerprint,
+    nullable,
+)
 
 revision: str = "0001_initial_schema"
 down_revision: str | None = None
@@ -52,9 +57,9 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint("btrim(external_id) <> ''", name="external_id_not_blank"),
-        sa.CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
-        sa.CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_is_iso4217"),
+        sa.CheckConstraint("TRIM(external_id) <> ''", name="external_id_not_blank"),
+        sa.CheckConstraint("TRIM(name) <> ''", name="name_not_blank"),
+        sa.CheckConstraint(is_iso4217_currency("currency"), name="currency_is_iso4217"),
         sa.PrimaryKeyConstraint("id", name="pk_accounts"),
         sa.UniqueConstraint("external_id", name="uq_accounts_external_id"),
     )
@@ -76,8 +81,8 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint("btrim(external_id) <> ''", name="external_id_not_blank"),
-        sa.CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
+        sa.CheckConstraint("TRIM(external_id) <> ''", name="external_id_not_blank"),
+        sa.CheckConstraint("TRIM(name) <> ''", name="name_not_blank"),
         sa.CheckConstraint(
             "effective_to IS NULL OR effective_to >= effective_from",
             name="effective_period_is_ordered",
@@ -113,15 +118,15 @@ def upgrade() -> None:
         ),
         sa.Column("overage_price", sa.Numeric(precision=19, scale=4), nullable=True),
         sa.Column("minimum_commitment", sa.Numeric(precision=19, scale=4), nullable=True),
-        sa.Column("tier_schedule", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("tier_schedule", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint("btrim(metric_key) <> ''", name="metric_key_not_blank"),
-        sa.CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_is_iso4217"),
+        sa.CheckConstraint("TRIM(metric_key) <> ''", name="metric_key_not_blank"),
+        sa.CheckConstraint(is_iso4217_currency("currency"), name="currency_is_iso4217"),
         sa.CheckConstraint(
             "billing_mode IN ('PER_UNIT', 'TIERED', 'COMMITMENT')",
             name="billing_mode_is_known",

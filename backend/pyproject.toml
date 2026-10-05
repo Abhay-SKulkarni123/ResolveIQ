@@ -16,6 +16,9 @@ dependencies = [
     "sqlalchemy>=2.0.36",
     "alembic>=1.14",
     "psycopg[binary]>=3.2",
+    # MySQL driver for local development. Pure Python, so no build toolchain is
+    # needed on Windows the way mysqlclient would require.
+    "pymysql>=1.1",
     "httpx>=0.27",
 ]
 

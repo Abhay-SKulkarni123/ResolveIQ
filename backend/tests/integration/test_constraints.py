@@ -18,7 +18,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.adapters.persistence import Account, Contract, ContractPriceTerm
@@ -55,13 +55,21 @@ def contract(db_session: Session, account: Account) -> Contract:
 
 
 def commit_expecting_failure(session: Session) -> IntegrityError:
-    """Commit the pending rows and return the IntegrityError that must result.
+    """Commit the pending rows and return the error the constraint violation must raise.
 
     Rollback first so the session is usable again: PostgreSQL aborts the whole
     transaction on a constraint violation, and every later statement in it would
     fail with "current transaction is aborted".
+
+    MySQL classifies a CHECK violation (3819) as ``OperationalError`` rather than
+    ``IntegrityError``, so both are accepted there. That is an engine difference in
+    how the error is labelled, not a difference in enforcement: the statement still
+    fails and the row is still rejected, which is what these tests assert.
     """
-    with pytest.raises(IntegrityError) as caught:
+    expected: tuple[type[Exception], ...] = (IntegrityError,)
+    if session.get_bind().dialect.name == "mysql":
+        expected = (IntegrityError, OperationalError)
+    with pytest.raises(expected) as caught:
         session.commit()
     session.rollback()
     return caught.value
@@ -532,7 +540,11 @@ def _insert_account_with_null(column: str, engine) -> None:
 
 @pytest.mark.parametrize("column", ["external_id", "name", "currency"])
 def test_a_missing_required_column_is_rejected_by_the_server(engine, column: str) -> None:
-    """Raw SQL, so what is under test is PostgreSQL's NOT NULL and not the ORM's."""
+    """Raw SQL, so what is under test is the server's NOT NULL and not the ORM's.
+
+    MySQL reports a NOT NULL violation as ``IntegrityError`` too, so the same
+    assertion holds on both engines.
+    """
     with pytest.raises(IntegrityError) as caught:
         _insert_account_with_null(column, engine)
     assert "null value" in str(caught.value.orig).lower()

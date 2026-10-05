@@ -44,6 +44,8 @@ from typing import Any
 from uuid import UUID, uuid5
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.mysql import Insert as MySQLInsert
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -280,14 +282,27 @@ class SqlAlchemyCaseRepository:
         ]
         if not pending:
             return
-        statement = pg_insert(DisputeEvidenceRow).values(pending)
-        statement = statement.on_conflict_do_nothing(
-            index_elements=[
-                DisputeEvidenceRow.dispute_id,
-                DisputeEvidenceRow.natural_key,
-                DisputeEvidenceRow.content_hash,
-            ]
-        )
+        arbiter = [
+            DisputeEvidenceRow.dispute_id,
+            DisputeEvidenceRow.natural_key,
+            DisputeEvidenceRow.content_hash,
+        ]
+        # Two spellings of the same "insert unless the unique index already has it".
+        statement: Any
+        if self._session.get_bind().dialect.name == "postgresql":
+            statement = pg_insert(DisputeEvidenceRow).values(pending).on_conflict_do_nothing(
+                index_elements=arbiter
+            )
+        else:
+            # MySQL has no ON CONFLICT. ON DUPLICATE KEY UPDATE with every column set
+            # to itself is the equivalent no-op: the unique index is still the arbiter,
+            # and unlike INSERT IGNORE it does not also silence unrelated errors.
+            # Assigning each arbiter column to itself is the no-op form; it renders
+            # as ``col = table.col`` and needs no ``inserted`` alias.
+            upsert: MySQLInsert = mysql_insert(DisputeEvidenceRow).values(pending)
+            statement = upsert.on_duplicate_key_update(
+                **{column.name: column for column in arbiter}
+            )
         self._session.execute(statement)
 
     def _evidence_id_map(self, case: DisputeCase) -> dict[tuple[str, str], UUID]:

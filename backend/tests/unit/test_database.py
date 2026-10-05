@@ -91,7 +91,7 @@ def test_a_password_shaped_like_a_url_is_still_masked() -> None:
 
 
 def test_sqlite_is_refused_rather_than_silently_accepted() -> None:
-    """ADR-014: PostgreSQL only.
+    """ADR-014: PostgreSQL is the reference; MySQL is also supported.
 
     A SQLite URL would build a working engine and then behave wrongly: JSONB,
     native uuid and timestamptz all have different semantics there, and the
@@ -105,9 +105,20 @@ def test_unsupported_backend_error_is_a_configuration_error() -> None:
     assert issubclass(UnsupportedDatabaseError, DatabaseConfigurationError)
 
 
-def test_mysql_is_refused_too() -> None:
-    with pytest.raises(UnsupportedDatabaseError):
-        create_engine_for_url("mysql+pymysql://user:pass@localhost/resolveiq")
+def test_mysql_is_now_accepted() -> None:
+    """MySQL became a supported backend so the repository can run against it.
+
+    ``create_engine`` is lazy and never connects here, so this asserts only that the
+    URL is admitted rather than refused -- the same construction path PostgreSQL takes.
+    """
+    engine = create_engine_for_url("mysql+pymysql://user:pass@localhost/resolveiq")
+    assert engine.dialect.name == "mysql"
+
+
+def test_an_unsupported_backend_is_still_refused() -> None:
+    """Widening the supported set must not turn the guard into a no-op."""
+    with pytest.raises(UnsupportedDatabaseError, match="ADR-014"):
+        create_engine_for_url("oracle+cx_oracle://user:pass@localhost/resolveiq")
 
 
 def test_an_invalid_url_is_reported_as_a_configuration_error() -> None:

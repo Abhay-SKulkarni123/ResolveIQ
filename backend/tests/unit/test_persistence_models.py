@@ -28,6 +28,7 @@ from app.adapters.persistence import (
     Contract,
     ContractPriceTerm,
 )
+from app.adapters.persistence.ddl import is_iso4217_currency
 from app.domain.contracts import BILLING_MODE_VALUES, CONTRACT_STATUS_VALUES
 
 DIALECT = postgresql.dialect()
@@ -429,7 +430,7 @@ def test_billing_mode_check_lists_every_enum_member() -> None:
 @pytest.mark.parametrize(
     ("table_name", "expected"),
     [
-        ("accounts", "currency ~ '^[A-Z]{3}$'"),
+        ("accounts", is_iso4217_currency("currency")),
         ("contracts", "effective_to IS NULL OR effective_to >= effective_from"),
         ("contract_price_terms", "included_units >= 0"),
         ("contract_price_terms", "unit_price IS NULL OR unit_price >= 0"),

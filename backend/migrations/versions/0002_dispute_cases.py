@@ -54,6 +54,11 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
+from app.adapters.persistence.ddl import (
+    is_iso4217_currency,
+    is_sha256_fingerprint,
+    nullable,
+)
 
 revision: str = "0002_dispute_cases"
 down_revision: str | None = "0001_initial_schema"
@@ -62,7 +67,7 @@ depends_on: str | Sequence[str] | None = None
 
 MONEY = sa.Numeric(19, 4)
 PROBABILITY = sa.Numeric(5, 4)
-JSONB = postgresql.JSONB(astext_type=sa.Text())
+JSONB = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
 
 
 def upgrade() -> None:
@@ -96,9 +101,9 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint("btrim(external_id) <> ''", name="external_id_not_blank"),
+        sa.CheckConstraint("TRIM(external_id) <> ''", name="external_id_not_blank"),
         sa.CheckConstraint(
-            "btrim(invoice_external_id) <> ''", name="invoice_external_id_not_blank"
+            "TRIM(invoice_external_id) <> ''", name="invoice_external_id_not_blank"
         ),
         sa.CheckConstraint(
             "status IN ('OPEN','INVESTIGATING','AWAITING_REVIEW','RESOLVED','REJECTED','REOPENED')",
@@ -107,7 +112,7 @@ def upgrade() -> None:
         sa.CheckConstraint("severity IN ('LOW','MEDIUM','HIGH','CRITICAL')", name="severity_is_known"),
         sa.CheckConstraint("version >= 1", name="version_is_positive"),
         sa.CheckConstraint(
-            "evidence_fingerprint ~ '^sha256:[0-9a-f]{64}$'", name="fingerprint_is_sha256"
+            is_sha256_fingerprint("evidence_fingerprint"), name="fingerprint_is_sha256"
         ),
         sa.ForeignKeyConstraint(
             ["account_id"], ["accounts.id"], name="fk_disputes_account_id_accounts", ondelete="RESTRICT"
@@ -144,9 +149,9 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint("btrim(natural_key) <> ''", name="natural_key_not_blank"),
+        sa.CheckConstraint("TRIM(natural_key) <> ''", name="natural_key_not_blank"),
         sa.CheckConstraint(
-            "content_hash ~ '^sha256:[0-9a-f]{64}$'", name="content_hash_is_sha256"
+            is_sha256_fingerprint("content_hash"), name="content_hash_is_sha256"
         ),
         sa.ForeignKeyConstraint(
             ["dispute_id"],
@@ -206,7 +211,7 @@ def upgrade() -> None:
             name="status_is_known",
         ),
         sa.CheckConstraint(
-            "evidence_fingerprint ~ '^sha256:[0-9a-f]{64}$'", name="fingerprint_is_sha256"
+            is_sha256_fingerprint("evidence_fingerprint"), name="fingerprint_is_sha256"
         ),
         sa.ForeignKeyConstraint(
             ["dispute_id"],
@@ -259,7 +264,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_is_iso4217"),
+        sa.CheckConstraint(is_iso4217_currency("currency"), name="currency_is_iso4217"),
         sa.CheckConstraint(
             "NOT is_provisional OR is_complete = false", name="provisional_totals_are_incomplete"
         ),
@@ -332,7 +337,7 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "confidence >= 0 AND confidence <= 1", name="confidence_in_unit_range"
         ),
-        sa.CheckConstraint("btrim(narrative) <> ''", name="narrative_not_blank"),
+        sa.CheckConstraint("TRIM(narrative) <> ''", name="narrative_not_blank"),
         sa.ForeignKeyConstraint(
             ["investigation_id"],
             ["investigations.id"],
@@ -381,12 +386,12 @@ def upgrade() -> None:
         # that has to be storable.
         sa.CheckConstraint(
             "impact_amount IS NOT NULL "
-            "OR COALESCE(BTRIM(impact_basis), '') <> '' "
-            "OR COALESCE(BTRIM(not_assessable_reason), '') <> ''",
+            "OR COALESCE(TRIM(impact_basis), '') <> '' "
+            "OR COALESCE(TRIM(not_assessable_reason), '') <> ''",
             name="missing_impact_is_explained",
         ),
         sa.CheckConstraint(
-            "impact_amount IS NULL OR COALESCE(BTRIM(impact_basis), '') <> ''",
+            "impact_amount IS NULL OR COALESCE(TRIM(impact_basis), '') <> ''",
             name="amount_implies_basis",
         ),
         sa.CheckConstraint(
@@ -398,7 +403,7 @@ def upgrade() -> None:
             name="amount_implies_currency",
         ),
         sa.CheckConstraint(
-            "impact_currency IS NULL OR impact_currency ~ '^[A-Z]{3}$'",
+            nullable("impact_currency", is_iso4217_currency("impact_currency")),
             name="currency_is_iso4217",
         ),
         sa.CheckConstraint(
@@ -435,7 +440,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.CheckConstraint("btrim(rationale) <> ''", name="rationale_not_blank"),
+        sa.CheckConstraint("TRIM(rationale) <> ''", name="rationale_not_blank"),
         sa.ForeignKeyConstraint(
             ["investigation_id"],
             ["investigations.id"],
@@ -479,7 +484,7 @@ def upgrade() -> None:
             "target_type IN ('FINDING','HYPOTHESIS','RESOLUTION_OPTION')",
             name="target_type_is_known",
         ),
-        sa.CheckConstraint("btrim(actor_id) <> ''", name="actor_id_not_blank"),
+        sa.CheckConstraint("TRIM(actor_id) <> ''", name="actor_id_not_blank"),
         # An amendment without a replacement, or a replacement without an amendment,
         # is a row nobody can interpret.
         sa.CheckConstraint(
@@ -487,11 +492,11 @@ def upgrade() -> None:
             name="amendment_matches_action",
         ),
         sa.CheckConstraint(
-            "amended_narrative IS NULL OR btrim(amended_narrative) <> ''",
+            "amended_narrative IS NULL OR TRIM(amended_narrative) <> ''",
             name="amendment_not_blank",
         ),
         sa.CheckConstraint(
-            "evidence_fingerprint_seen ~ '^sha256:[0-9a-f]{64}$'",
+            is_sha256_fingerprint("evidence_fingerprint_seen"),
             name="fingerprint_is_sha256",
         ),
         sa.ForeignKeyConstraint(

@@ -138,14 +138,27 @@ def connection(engine: Engine) -> Iterator[object]:
         yield active
 
 
+def _schema_expression(dialect_name: str) -> str:
+    """SQL returning the current schema name as a single string.
+
+    PostgreSQL calls the default schema ``public`` and exposes
+    ``current_schema()``; MySQL has no separate schema namespace and exposes the
+    current database as ``DATABASE()``. Hard-coding ``'public'`` silently returned
+    nothing on MySQL, which would have made every table-presence assertion pass
+    vacuously.
+    """
+    return "current_schema()" if dialect_name == "postgresql" else "DATABASE()"
+
+
 def table_names(connection: object) -> set[str]:
-    """Every table in the public schema, excluding alembic's own bookkeeping."""
+    """Every table in the current schema, excluding alembic's own bookkeeping."""
+    dialect_name = connection.engine.dialect.name  # type: ignore[attr-defined]
     result = connection.execute(  # type: ignore[attr-defined]
         text(
-            """
+            f"""
             SELECT table_name
             FROM information_schema.tables
-            WHERE table_schema = 'public'
+            WHERE table_schema = {_schema_expression(dialect_name)}
               AND table_type = 'BASE TABLE'
               AND table_name <> 'alembic_version'
             """
@@ -154,16 +167,37 @@ def table_names(connection: object) -> set[str]:
     return set(result.scalars())
 
 
+#: MySQL always reports a table's primary key as ``PRIMARY`` and ignores whatever
+#: ``CONSTRAINT`` name was supplied for it, so it cannot carry the
+#: ``pk_<table>`` name that PostgreSQL records. This maps that engine-mandated
+#: name back so the same expectation can be asserted on both.
+MYSQL_PRIMARY_KEY_NAME = "PRIMARY"
+
+
 def constraint_names(connection: object, table: str) -> set[str]:
-    """Every constraint on ``table``, whatever its type."""
-    result = connection.execute(  # type: ignore[attr-defined]
-        text(
-            """
-            SELECT conname
-            FROM pg_constraint
-            WHERE conrelid = to_regclass(:table_name)
-            """
-        ),
-        {"table_name": f"public.{table}"},
-    )
+    """Every constraint on ``table``, whatever its type, in either dialect."""
+    dialect_name = connection.engine.dialect.name  # type: ignore[attr-defined]
+    if dialect_name == "mysql":
+        result = connection.execute(  # type: ignore[attr-defined]
+            text(
+                """
+                SELECT constraint_name
+                FROM information_schema.table_constraints
+                WHERE table_schema = DATABASE()
+                  AND table_name = :table_name
+                """
+            ),
+            {"table_name": table},
+        )
+    else:
+        result = connection.execute(  # type: ignore[attr-defined]
+            text(
+                """
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(:table_name)
+                """
+            ),
+            {"table_name": f"public.{table}"},
+        )
     return set(result.scalars())

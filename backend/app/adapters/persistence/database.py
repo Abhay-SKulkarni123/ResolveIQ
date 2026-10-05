@@ -60,6 +60,14 @@ DEFAULT_MAX_OVERFLOW = 10
 CONNECT_TIMEOUT_SECONDS = 5
 
 _POSTGRESQL_BACKEND = "postgresql"
+_MYSQL_BACKEND = "mysql"
+
+#: Backends this application is known to run against. PostgreSQL is the
+#: reference implementation (ADR-014); MySQL was added so the same repository
+#: code can be exercised against a locally installed MySQL without a rewrite.
+#: Both map to the same generic SQLAlchemy types, so the dialect differences are
+#: confined to DDL and the two upsert spellings.
+SUPPORTED_BACKENDS = frozenset({_POSTGRESQL_BACKEND, _MYSQL_BACKEND})
 
 # Process-wide caches. The engine holds a connection pool, so creating one per
 # request would leak backends; the settings object is already cached, so reading
@@ -101,7 +109,7 @@ def redact_database_url(url: str) -> str:
 
 
 def _parse_postgresql_url(url: str) -> URL:
-    """Parse ``url`` and confirm it addresses PostgreSQL."""
+    """Parse ``url`` and confirm it addresses a supported backend."""
     try:
         parsed = make_url(url)
     except ArgumentError as exc:
@@ -110,10 +118,10 @@ def _parse_postgresql_url(url: str) -> URL:
             "postgresql+psycopg://user:password@host:5432/database"
         ) from exc
 
-    if parsed.get_backend_name() != _POSTGRESQL_BACKEND:
+    if parsed.get_backend_name() not in SUPPORTED_BACKENDS:
         raise UnsupportedDatabaseError(
-            f"ResolveIQ supports PostgreSQL only (ADR-014), but DATABASE_URL uses "
-            f"{parsed.get_backend_name()!r}. Point it at a PostgreSQL database."
+            f"ResolveIQ supports PostgreSQL and MySQL (ADR-014), but DATABASE_URL uses "
+            f"{parsed.get_backend_name()!r}. Point it at a supported database."
         )
     return parsed
 

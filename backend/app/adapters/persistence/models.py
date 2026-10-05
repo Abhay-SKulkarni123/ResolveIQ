@@ -76,6 +76,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     Date,
     ForeignKey,
@@ -85,10 +86,13 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.adapters.persistence.base import Base, IngestedAtMixin, UuidPrimaryKeyMixin
+from app.adapters.persistence.ddl import (
+    is_iso4217_currency,
+)
 from app.domain.contracts import BILLING_MODE_VALUES, CONTRACT_STATUS_VALUES
 
 __all__ = ["Account", "Contract", "ContractPriceTerm"]
@@ -110,7 +114,7 @@ _MAX_METRIC_KEY_LENGTH = 64
 _MAX_STATE_LENGTH = 32
 
 # SQL fragments shared by the check constraints below.
-_CURRENCY_IS_ISO4217 = "currency ~ '^[A-Z]{3}$'"
+_CURRENCY_IS_ISO4217 = is_iso4217_currency("currency")
 
 
 def _in_list(column: str, allowed: tuple[str, ...]) -> str:
@@ -131,8 +135,8 @@ class Account(Base, UuidPrimaryKeyMixin, IngestedAtMixin):
 
     __tablename__ = "accounts"
     __table_args__ = (
-        CheckConstraint("btrim(external_id) <> ''", name="external_id_not_blank"),
-        CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
+        CheckConstraint("TRIM(external_id) <> ''", name="external_id_not_blank"),
+        CheckConstraint("TRIM(name) <> ''", name="name_not_blank"),
         CheckConstraint(_CURRENCY_IS_ISO4217, name="currency_is_iso4217"),
     )
 
@@ -162,8 +166,8 @@ class Contract(Base, UuidPrimaryKeyMixin, IngestedAtMixin):
 
     __tablename__ = "contracts"
     __table_args__ = (
-        CheckConstraint("btrim(external_id) <> ''", name="external_id_not_blank"),
-        CheckConstraint("btrim(name) <> ''", name="name_not_blank"),
+        CheckConstraint("TRIM(external_id) <> ''", name="external_id_not_blank"),
+        CheckConstraint("TRIM(name) <> ''", name="name_not_blank"),
         CheckConstraint(_in_list("status", CONTRACT_STATUS_VALUES), name="status_is_known"),
         # An end date before the start date is never a legitimate agreement.
         # NULL end means the contract is open-ended, which the comparison
@@ -227,7 +231,7 @@ class ContractPriceTerm(Base, UuidPrimaryKeyMixin, IngestedAtMixin):
     __table_args__ = (
         # "One row per metered metric" (docs/SYSTEM_DESIGN.md §3.2).
         UniqueConstraint("contract_id", "metric_key"),
-        CheckConstraint("btrim(metric_key) <> ''", name="metric_key_not_blank"),
+        CheckConstraint("TRIM(metric_key) <> ''", name="metric_key_not_blank"),
         CheckConstraint(_CURRENCY_IS_ISO4217, name="currency_is_iso4217"),
         CheckConstraint(
             _in_list("billing_mode", BILLING_MODE_VALUES), name="billing_mode_is_known"
@@ -303,6 +307,8 @@ class ContractPriceTerm(Base, UuidPrimaryKeyMixin, IngestedAtMixin):
     #: child table because a ladder is always read and written as a whole
     #: document and is never queried across contracts; the relational form would
     #: add ordering and integrity machinery for no query it would serve.
-    tier_schedule: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    tier_schedule: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+    )
 
     contract: Mapped[Contract] = relationship(back_populates="price_terms")
