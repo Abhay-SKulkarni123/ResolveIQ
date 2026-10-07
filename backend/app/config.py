@@ -33,7 +33,7 @@ def _sibling_database_url(url: str, database_name: str) -> str:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         # The repository keeps `.env` at its root while every command runs from
-        # `backend/` (see the Makefile), so a bare ".env" would never be found.
+        # `backend/`, so a bare ".env" would never be found.
         # Later entries win in pydantic-settings, so a backend-local file still
         # overrides the shared one.
         env_file=("../.env", ".env"),

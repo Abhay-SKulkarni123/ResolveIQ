@@ -320,8 +320,7 @@ recorded with its reasoning rather than an omission.
 27 ADRs in [`docs/ENGINEERING_DECISIONS.md`](docs/ENGINEERING_DECISIONS.md), each with the rejected
 alternatives. Per-requirement status in
 [`docs/REQUIREMENTS_TRACEABILITY.md`](docs/REQUIREMENTS_TRACEABILITY.md). Architecture in
-[`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md), SOLID mapping in [`docs/SOLID.md`](docs/SOLID.md),
-narrative walkthrough in [`docs/INTERVIEW_GUIDE.md`](docs/INTERVIEW_GUIDE.md).
+[`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md), SOLID mapping in [`docs/SOLID.md`](docs/SOLID.md).
 
 Nothing in this README is marked verified unless the command above was run and its result is recorded. No
 requirement is marked "implemented and tested" on the basis of a skipped or failing test.
