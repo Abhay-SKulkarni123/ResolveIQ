@@ -54,6 +54,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
+
 from app.adapters.persistence.ddl import (
     is_iso4217_currency,
     is_sha256_fingerprint,
@@ -522,31 +523,21 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_finding_reviews_target", table_name="finding_reviews")
-    op.drop_index("ix_finding_reviews_dispute_id_created_at", table_name="finding_reviews")
+    # Indexes are dropped implicitly by DROP TABLE rather than by an explicit
+    # op.drop_index(). MySQL refuses to drop an index that a foreign key on the
+    # same table depends on (error 1553): ix_finding_reviews_dispute_id_created_at
+    # is the supporting index for fk_finding_reviews_dispute_id_disputes, and
+    # ix_disputes_* / ix_investigations_* play the same role on their tables.
+    # PostgreSQL permits those drops, so writing them explicitly made this
+    # downgrade succeed on PostgreSQL and fail on MySQL -- leaving every table
+    # behind, which then poisoned every later test in the suite. DROP TABLE
+    # removes the index and the constraint together on both engines, so the
+    # explicit drops were redundant as well as unportable.
     op.drop_table("finding_reviews")
-
-    op.drop_index(
-        "ix_investigation_resolution_options_investigation_id",
-        table_name="investigation_resolution_options",
-    )
     op.drop_table("investigation_resolution_options")
-
-    op.drop_index(
-        "ix_investigation_hypotheses_investigation_id",
-        table_name="investigation_hypotheses",
-    )
     op.drop_table("investigation_hypotheses")
-
-    op.drop_index("ix_investigation_findings_investigation_id", table_name="investigation_findings")
     op.drop_table("investigation_findings")
-
-    op.drop_index(
-        "ix_investigation_evidence_evidence_item_id", table_name="investigation_evidence"
-    )
     op.drop_table("investigation_evidence")
-
-    op.drop_index("ix_calculations_dispute_id", table_name="calculations")
     op.drop_table("calculations")
 
     # Break the disputes <-> investigations cycle before dropping either side.
@@ -556,14 +547,6 @@ def downgrade() -> None:
         type_="foreignkey",
     )
 
-    op.drop_index("ix_investigations_stale_at", table_name="investigations")
-    op.drop_index("ix_investigations_dispute_id", table_name="investigations")
     op.drop_table("investigations")
-
-    op.drop_index("ix_dispute_evidence_items_natural_key", table_name="dispute_evidence_items")
-    op.drop_index("ix_dispute_evidence_items_dispute_id", table_name="dispute_evidence_items")
     op.drop_table("dispute_evidence_items")
-
-    op.drop_index("ix_disputes_status_created_at", table_name="disputes")
-    op.drop_index("ix_disputes_invoice_external_id", table_name="disputes")
     op.drop_table("disputes")

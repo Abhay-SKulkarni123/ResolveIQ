@@ -37,7 +37,43 @@ MIGRATIONS_DIR = BACKEND_ROOT / "migrations"
 
 #: Tables Alembic and the models own. Everything else in the database is not ours
 #: and must not be inspected or dropped.
-MANAGED_TABLES = ("accounts", "contracts", "contract_price_terms")
+#:
+#: Deliberately an explicit list rather than derived from ``Base.metadata``. The
+#: point of these tests is to compare what the migration built against an
+#: expectation that does not come from the models themselves; a table declared on
+#: a model but never migrated, or migrated but dropped from the model, is exactly
+#: the drift being looked for.
+MANAGED_TABLES = (
+    "accounts",
+    "calculations",
+    "contract_price_terms",
+    "contracts",
+    "dispute_evidence_items",
+    "disputes",
+    "finding_reviews",
+    "investigation_evidence",
+    "investigation_findings",
+    "investigation_hypotheses",
+    "investigation_resolution_options",
+    "investigations",
+)
+
+#: Tables that carry a ``created_at``. ``investigation_evidence`` and
+#: ``dispute_evidence_items`` are link tables identified by their two foreign
+#: keys, so they inherit no timestamps of their own; asserting that every managed
+#: table has one would be asserting something untrue.
+TIMESTAMPED_TABLES = (
+    "accounts",
+    "calculations",
+    "contract_price_terms",
+    "contracts",
+    "disputes",
+    "finding_reviews",
+    "investigation_findings",
+    "investigation_hypotheses",
+    "investigation_resolution_options",
+    "investigations",
+)
 
 
 @pytest.fixture(scope="session")
@@ -138,7 +174,7 @@ def connection(engine: Engine) -> Iterator[object]:
         yield active
 
 
-def _schema_expression(dialect_name: str) -> str:
+def schema_expression(dialect_name: str) -> str:
     """SQL returning the current schema name as a single string.
 
     PostgreSQL calls the default schema ``public`` and exposes
@@ -150,6 +186,48 @@ def _schema_expression(dialect_name: str) -> str:
     return "current_schema()" if dialect_name == "postgresql" else "DATABASE()"
 
 
+#: How a logical column type is physically spelled by each engine, for the
+#: assertions that read ``information_schema``.
+#:
+#: These are differences of capability rather than of intent: MySQL has no
+#: ``uuid`` type, so a uuid is stored as ``CHAR(32)``; it has no ``jsonb``, so a
+#: ladder is stored as ``json``; it has no ``timestamptz``, so an instant is
+#: stored as ``datetime``. Asserting PostgreSQL's spelling on MySQL would fail
+#: for a schema that is doing exactly what was asked of it, so the expected
+#: spelling is looked up for the engine under test instead.
+PHYSICAL_TYPES: dict[str, dict[str, str]] = {
+    "postgresql": {
+        "decimal": "numeric",
+        "json": "jsonb",
+        "uuid": "uuid",
+        "instant": "timestamp with time zone",
+    },
+    "mysql": {
+        "decimal": "decimal",
+        "json": "json",
+        "uuid": "char",
+        "instant": "datetime",
+    },
+}
+
+#: Data types that would make a money column inexact. Spelled per engine for the
+#: same reason as :data:`PHYSICAL_TYPES`.
+FLOATING_POINT_DATA_TYPES: dict[str, tuple[str, ...]] = {
+    "postgresql": ("double precision", "real"),
+    "mysql": ("double", "float"),
+}
+
+
+def physical_type(dialect_name: str, logical: str) -> str:
+    """The type name ``logical`` compiles to on ``dialect_name``."""
+    return PHYSICAL_TYPES[dialect_name][logical]
+
+
+def floating_point_data_types(dialect_name: str) -> tuple[str, ...]:
+    """Every data type that would make a money column inexact on this engine."""
+    return FLOATING_POINT_DATA_TYPES[dialect_name]
+
+
 def table_names(connection: object) -> set[str]:
     """Every table in the current schema, excluding alembic's own bookkeeping."""
     dialect_name = connection.engine.dialect.name  # type: ignore[attr-defined]
@@ -158,7 +236,7 @@ def table_names(connection: object) -> set[str]:
             f"""
             SELECT table_name
             FROM information_schema.tables
-            WHERE table_schema = {_schema_expression(dialect_name)}
+            WHERE table_schema = {schema_expression(dialect_name)}
               AND table_type = 'BASE TABLE'
               AND table_name <> 'alembic_version'
             """

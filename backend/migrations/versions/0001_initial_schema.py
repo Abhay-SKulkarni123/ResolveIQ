@@ -32,10 +32,9 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
+
 from app.adapters.persistence.ddl import (
     is_iso4217_currency,
-    is_sha256_fingerprint,
-    nullable,
 )
 
 revision: str = "0001_initial_schema"
@@ -110,10 +109,15 @@ def upgrade() -> None:
         sa.Column("billing_mode", sa.String(length=32), nullable=False),
         sa.Column("currency", sa.String(length=3), nullable=False),
         sa.Column("unit_price", sa.Numeric(precision=19, scale=4), nullable=True),
+        # Written at the column's own scale rather than as bare "0". Both servers
+        # normalise a numeric default to the column's scale when they store it --
+        # MySQL turns "0" into "0.0000" -- and `alembic check` compares the
+        # spelling in the model against the spelling the server reports, so the
+        # two have to be equal rather than merely numerically the same.
         sa.Column(
             "included_units",
             sa.Numeric(precision=19, scale=4),
-            server_default=sa.text("0"),
+            server_default=sa.text("0.0000"),
             nullable=False,
         ),
         sa.Column("overage_price", sa.Numeric(precision=19, scale=4), nullable=True),
@@ -166,7 +170,13 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Reverse creation order so that foreign keys never dangle.
+    #
+    # The indexes are dropped implicitly by DROP TABLE rather than by an explicit
+    # op.drop_index(). MySQL refuses to drop an index that a foreign key on the
+    # same table depends on (error 1553), and ix_contracts_account_id is exactly
+    # that index for fk_contracts_account_id_accounts. PostgreSQL permits the drop,
+    # so writing it explicitly made the downgrade work on one engine and fail on
+    # the other. DROP TABLE removes the index and the constraint together on both.
     op.drop_table("contract_price_terms")
-    op.drop_index("ix_contracts_account_id", table_name="contracts")
     op.drop_table("contracts")
     op.drop_table("accounts")

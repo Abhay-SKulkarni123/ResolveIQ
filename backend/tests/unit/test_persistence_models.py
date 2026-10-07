@@ -215,11 +215,18 @@ def test_contract_status_defaults_to_draft() -> None:
 
 
 def test_included_units_defaults_to_zero() -> None:
-    """No included units means every unit is charged."""
+    """No included units means every unit is charged.
+
+    The server default is written at the column's own scale rather than as bare
+    ``"0"`` because both servers normalise a numeric default to that scale when
+    they store it, and ``alembic check`` compares the spelling in the model with
+    the spelling the server reports. Numerically it is the same zero either way,
+    which is what is asserted here.
+    """
     column = Base.metadata.tables["contract_price_terms"].columns["included_units"]
     assert column.default is not None and column.default.arg == Decimal("0")
     assert column.server_default is not None
-    assert str(column.server_default.arg) == "0"
+    assert Decimal(str(column.server_default.arg)) == Decimal("0")
 
 
 def test_primary_key_is_generated_in_python_without_a_round_trip() -> None:

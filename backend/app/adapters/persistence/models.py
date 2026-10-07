@@ -288,7 +288,7 @@ class ContractPriceTerm(Base, UuidPrimaryKeyMixin, IngestedAtMixin):
         Numeric(precision=QUANTITY_PRECISION, scale=QUANTITY_SCALE),
         nullable=False,
         default=Decimal("0"),
-        server_default=text("0"),
+        server_default=text("0.0000"),
     )
 
     #: Price applied to units beyond ``included_units``.
@@ -308,7 +308,15 @@ class ContractPriceTerm(Base, UuidPrimaryKeyMixin, IngestedAtMixin):
     #: document and is never queried across contracts; the relational form would
     #: add ordering and integrity machinery for no query it would serve.
     tier_schedule: Mapped[dict[str, Any] | None] = mapped_column(
-        JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+        # ``none_as_null``: "no ladder" has to be SQL NULL, because the check
+        # constraint above asks exactly that question -- ``tier_schedule IS NOT
+        # NULL``. With SQLAlchemy's default, the Python value ``None`` is written
+        # as the JSON literal ``null``, which is a value rather than an absence:
+        # a term built with ``tier_schedule=None`` would satisfy ``IS NOT NULL``
+        # and be rejected as a non-tiered row carrying a ladder. None has to mean
+        # the same thing whether it is passed explicitly or left unset.
+        JSON(none_as_null=True).with_variant(postgresql.JSONB(none_as_null=True), "postgresql"),
+        nullable=True,
     )
 
     contract: Mapped[Contract] = relationship(back_populates="price_terms")

@@ -1,9 +1,18 @@
-"""The migration is applied, reversed and applied again against real PostgreSQL.
+"""The migration is applied, reversed and applied again against a real server.
 
 These tests are the reason the migration exists in a form that can be trusted. A
 hand-written migration that has only ever been read is not a migration; this file
-executes it, inspects what PostgreSQL actually built, reverses it, and executes it
+executes it, inspects what the server actually built, reverses it, and executes it
 again.
+
+The database is inspected through ``information_schema``, which both PostgreSQL
+and MySQL implement, with the schema name and the physical spelling of each type
+resolved for the engine that is running. PostgreSQL names the default schema
+``public`` and has ``uuid``, ``jsonb`` and ``timestamptz``; MySQL has no separate
+schema namespace and stores the same three things as ``CHAR(32)``, ``JSON`` and
+``DATETIME``. Asserting one engine's spelling on the other would fail a schema
+that is doing exactly what was asked of it, so every assertion here is on the
+meaning of the column rather than on the spelling of one server.
 """
 
 from __future__ import annotations
@@ -16,7 +25,11 @@ from app.adapters.persistence import Base
 from tests.integration.conftest import (
     MANAGED_TABLES,
     MYSQL_PRIMARY_KEY_NAME,
+    TIMESTAMPED_TABLES,
     constraint_names,
+    floating_point_data_types,
+    physical_type,
+    schema_expression,
     table_names,
 )
 
@@ -129,32 +142,39 @@ def test_the_migration_survives_a_full_round_trip(alembic_config, engine) -> Non
 
 
 def test_downgrade_leaves_the_database_usable_for_the_next_run(alembic_config, engine) -> None:
-    """After a downgrade the schema is genuinely empty, not merely unversioned."""
+    """After a downgrade the next run starts from nothing, not from leftovers.
+
+    A downgrade that fails part-way leaves tables behind; the upgrade that follows
+    then meets tables it is not expecting. Asserting the schema is empty is only
+    half of it, so the schema is also rebuilt to prove nothing was left in the way.
+    """
     command.upgrade(alembic_config, "head")
     command.downgrade(alembic_config, "base")
     with engine.connect() as connection:
-        remaining = connection.execute(
-            text("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
-        ).scalar_one()
-    assert remaining == 0
+        assert table_names(connection) == set()
+    command.upgrade(alembic_config, "head")
+    with engine.connect() as connection:
+        assert table_names(connection) == set(MANAGED_TABLES)
+    command.downgrade(alembic_config, "base")
 
 
 # ---------------------------------------------------------------------------
-# what PostgreSQL actually built
+# what the server actually built
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("table_name", sorted(EXPECTED_COLUMNS))
 def test_columns_match_the_models(alembic_config, engine, table_name: str) -> None:
     command.upgrade(alembic_config, "head")
+    dialect = engine.dialect.name
     with engine.connect() as connection:
         actual = {
             row[0]
             for row in connection.execute(
                 text(
-                    """
+                    f"""
                     SELECT column_name FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = :name
+                    WHERE table_schema = {schema_expression(dialect)} AND table_name = :name
                     """
                 ),
                 {"name": table_name},
@@ -164,7 +184,6 @@ def test_columns_match_the_models(alembic_config, engine, table_name: str) -> No
     command.downgrade(alembic_config, "base")
 
 
-@pytest.mark.parametrize("table_name", sorted(EXPECTED_CONSTRAINTS))
 def expected_for(connection: object, table_name: str) -> set[str]:
     """Return the declared constraint names for ``table_name`` on this engine.
 
@@ -180,6 +199,7 @@ def expected_for(connection: object, table_name: str) -> set[str]:
     return names
 
 
+@pytest.mark.parametrize("table_name", sorted(EXPECTED_CONSTRAINTS))
 def test_constraint_names_are_exactly_as_declared(alembic_config, engine, table_name: str) -> None:
     """Named constraints can be asserted on, which is the point of naming them.
 
@@ -193,96 +213,149 @@ def test_constraint_names_are_exactly_as_declared(alembic_config, engine, table_
     command.downgrade(alembic_config, "base")
 
 
+#: The columns NEP-01 fixes at NUMERIC(19,4): three money columns and the
+#: quantity that is compared against them.
+EXACT_NUMERIC_COLUMNS = {
+    "unit_price",
+    "overage_price",
+    "minimum_commitment",
+    "included_units",
+}
+
+
 def test_money_columns_are_numeric_19_4_in_the_database(alembic_config, engine) -> None:
-    """NEP-01 as PostgreSQL stores it, not merely as the model declares it."""
+    """NEP-01 as the server stores it, not merely as the model declares it."""
     command.upgrade(alembic_config, "head")
+    dialect = engine.dialect.name
     with engine.connect() as connection:
         rows = connection.execute(
             text(
-                """
+                f"""
                 SELECT column_name, numeric_precision, numeric_scale, data_type
                 FROM information_schema.columns
-                WHERE table_schema = 'public'
+                WHERE table_schema = {schema_expression(dialect)}
                   AND table_name = 'contract_price_terms'
-                  AND data_type = 'numeric'
+                  AND data_type = :decimal_type
                 """
-            )
+            ),
+            {"decimal_type": physical_type(dialect, "decimal")},
         ).all()
-    assert rows, "expected numeric columns on contract_price_terms"
-    for name, precision, scale, data_type in rows:
-        assert data_type == "numeric", name
+    # Filtering on the engine's decimal type is what proves each of these four is
+    # stored exactly; the set proves none of them was missed.
+    found = {name for name, *_ in rows}
+    assert found == EXACT_NUMERIC_COLUMNS, found
+    for name, precision, scale, _data_type in rows:
         assert (precision, scale) == (19, 4), name
     command.downgrade(alembic_config, "base")
 
 
 def test_no_column_is_a_floating_point_type(alembic_config, engine) -> None:
+    """NEP-01: money must not sit in a column that cannot hold it exactly."""
     command.upgrade(alembic_config, "head")
+    dialect = engine.dialect.name
+    forbidden = floating_point_data_types(dialect)
+    placeholders = ", ".join(f":t{n}" for n in range(len(forbidden)))
     with engine.connect() as connection:
         floating = connection.execute(
             text(
-                """
+                f"""
                 SELECT table_name, column_name, data_type
                 FROM information_schema.columns
-                WHERE table_schema = 'public'
-                  AND data_type IN ('double precision', 'real')
+                WHERE table_schema = {schema_expression(dialect)}
+                  AND data_type IN ({placeholders})
                 """
-            )
+            ),
+            {f"t{n}": value for n, value in enumerate(forbidden)},
         ).all()
     assert floating == []
     command.downgrade(alembic_config, "base")
 
 
 def test_timestamps_are_stored_with_a_time_zone(alembic_config, engine) -> None:
+    """Every timestamp column carries a zone, spelled as this engine spells one.
+
+    PostgreSQL stores ``timestamp with time zone``. MySQL has no such type and
+    stores ``datetime``, which is a wall clock; the connection pins the MySQL
+    session to UTC so that wall clock is UTC by construction -- see
+    ``create_engine_for_url``. What is asserted on both engines is that every
+    table which declares a timestamp has one, and that no table which does not
+    declare one has quietly gained one.
+    """
     command.upgrade(alembic_config, "head")
+    dialect = engine.dialect.name
     with engine.connect() as connection:
         rows = (
             connection.execute(
                 text(
-                    """
+                    f"""
                 SELECT table_name FROM information_schema.columns
-                WHERE table_schema = 'public'
+                WHERE table_schema = {schema_expression(dialect)}
                   AND column_name = 'created_at'
-                  AND data_type = 'timestamp with time zone'
+                  AND data_type = :instant_type
                 """
-                )
+                ),
+                {"instant_type": physical_type(dialect, "instant")},
             )
             .scalars()
             .all()
         )
-    assert sorted(rows) == sorted(MANAGED_TABLES)
+    assert sorted(rows) == sorted(TIMESTAMPED_TABLES)
     command.downgrade(alembic_config, "base")
 
 
 def test_the_tier_ladder_is_jsonb(alembic_config, engine) -> None:
+    """A ladder is a JSON document held in the engine's own JSON type.
+
+    PostgreSQL has ``jsonb``, MySQL has ``json``. Neither is text and neither is a
+    child table, which is the property under test: a ladder is read and written as
+    a whole document and is never queried across contracts, so the relational form
+    would add ordering and integrity machinery for no query it would serve.
+    """
     command.upgrade(alembic_config, "head")
+    dialect = engine.dialect.name
     with engine.connect() as connection:
         data_type = connection.execute(
             text(
-                """
+                f"""
                 SELECT data_type FROM information_schema.columns
-                WHERE table_schema = 'public'
+                WHERE table_schema = {schema_expression(dialect)}
                   AND table_name = 'contract_price_terms'
                   AND column_name = 'tier_schedule'
                 """
             )
         ).scalar_one()
-    assert data_type == "jsonb"
+    assert data_type == physical_type(dialect, "json")
     command.downgrade(alembic_config, "base")
 
 
 def test_identifiers_use_the_native_uuid_type(alembic_config, engine) -> None:
+    """Every primary key is the engine's native fixed-width identifier type.
+
+    PostgreSQL has ``uuid``. MySQL does not, and stores the same value as
+    ``CHAR(32)``: fixed-width, exactly the encoding of a uuid, and never a
+    variable-width or lossy fallback. The width is asserted on MySQL for the same
+    reason the type is -- a ``CHAR(1)`` would satisfy a type check and break every
+    join.
+    """
     command.upgrade(alembic_config, "head")
+    dialect = engine.dialect.name
     with engine.connect() as connection:
         rows = connection.execute(
             text(
-                """
-                SELECT table_name, data_type FROM information_schema.columns
-                WHERE table_schema = 'public' AND column_name = 'id'
+                f"""
+                SELECT table_name, data_type, character_maximum_length
+                FROM information_schema.columns
+                WHERE table_schema = {schema_expression(dialect)} AND column_name = 'id'
                   AND table_name <> 'alembic_version'
                 """
             )
         ).all()
-    assert rows and all(data_type == "uuid" for _, data_type in rows)
+    assert rows, "expected at least one id column"
+    expected_type = physical_type(dialect, "uuid")
+    for table_name, data_type, length in rows:
+        assert data_type == expected_type, table_name
+        if dialect == "mysql":
+            assert length == 32, table_name
     command.downgrade(alembic_config, "base")
 
 

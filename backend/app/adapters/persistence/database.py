@@ -23,8 +23,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError, DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
@@ -126,6 +127,29 @@ def _parse_postgresql_url(url: str) -> URL:
     return parsed
 
 
+def _pin_mysql_session_to_utc(dbapi_connection: Any, connection_record: object) -> None:
+    """Give every new MySQL connection a UTC session clock.
+
+    ``created_at`` is written two different ways: by the application, as
+    ``datetime.now(timezone.utc)``, and by the schema, as ``DEFAULT now()``. On
+    PostgreSQL ``now()`` is a ``timestamptz`` and both land on the same instant
+    whatever zone the server happens to run in. MySQL has no zoned timestamp, so
+    ``DATETIME`` stores a wall clock and ``now()`` returns the *session's* wall
+    clock; left at the server default that is the host's local zone, and the two
+    writers then disagree by hours while looking perfectly plausible.
+
+    Pinning the session to UTC makes the wall clock UTC by construction, so the
+    bytes in the column are the instant both writers meant. This is set per
+    connection rather than globally because a pooled connection keeps its session
+    settings for as long as it lives.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET SESSION time_zone = '+00:00'")
+    finally:
+        cursor.close()
+
+
 def create_engine_for_url(url: str, *, echo: bool = False) -> Engine:
     """Build a new engine for ``url``.
 
@@ -135,8 +159,8 @@ def create_engine_for_url(url: str, *, echo: bool = False) -> Engine:
     first request after a quiet spell. The ping costs one round trip and removes
     an entire class of intermittent failure.
     """
-    _parse_postgresql_url(url)
-    return create_engine(
+    parsed = _parse_postgresql_url(url)
+    engine = create_engine(
         url,
         echo=echo,
         pool_pre_ping=True,
@@ -144,6 +168,9 @@ def create_engine_for_url(url: str, *, echo: bool = False) -> Engine:
         max_overflow=DEFAULT_MAX_OVERFLOW,
         connect_args={"connect_timeout": CONNECT_TIMEOUT_SECONDS},
     )
+    if parsed.get_backend_name() == _MYSQL_BACKEND:
+        event.listen(engine, "connect", _pin_mysql_session_to_utc)
+    return engine
 
 
 def get_engine(settings: Settings | None = None) -> Engine:
