@@ -495,7 +495,7 @@ def attach_snapshot(document: dict[str, Any], item: EvidenceItem) -> dict[str, A
     entry = {
         "natural_key": item.natural_key,
         "evidence_type": item.evidence_type.value,
-        "snapshot": dict(item.snapshot),
+        "snapshot": thaw_json(item.snapshot),
     }
     for existing in attached:
         if existing["natural_key"] != item.natural_key:

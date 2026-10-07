@@ -7,7 +7,9 @@ loaded, so they are worth pinning explicitly.
 
 from __future__ import annotations
 
-from app.config import TEST_DATABASE_NAME, Settings
+import pytest
+
+from app.config import DOTENV_PATH, REPO_ROOT, TEST_DATABASE_NAME, Settings
 
 BASE_URL = "postgresql+psycopg://resolveiq:hunter2@db.internal:6543/resolveiq"
 
@@ -79,3 +81,32 @@ def test_cors_origins_trims_whitespace_and_drops_empty_entries() -> None:
 
 def test_cors_origins_defaults_to_the_frontend_dev_server() -> None:
     assert settings().cors_origins == ["http://localhost:5173"]
+
+
+# ---------------------------------------------------------------------------
+# root .env resolution
+# ---------------------------------------------------------------------------
+
+
+def test_repo_root_is_the_workspace_with_its_env_beside_backend() -> None:
+    """The repository keeps one canonical ``.env`` at the root, next to ``backend/``."""
+    assert (REPO_ROOT / "backend").is_dir()
+    assert (REPO_ROOT / ".env.example").is_file()
+    assert DOTENV_PATH == REPO_ROOT / ".env"
+
+
+def test_settings_are_configured_to_read_the_root_env_file() -> None:
+    """The path pydantic-settings was told about, not a CWD-relative guess."""
+    assert Settings.model_config["env_file"] == str(DOTENV_PATH)
+
+
+def test_database_url_resolves_identically_from_any_working_directory(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: ``env_file`` used to be CWD-relative, so runs started from the
+    repository root, from ``backend/``, through uvicorn or through Alembic could
+    resolve a different (or no) ``.env``. The value must be the same everywhere."""
+    from_repo_root = Settings().database_url
+    monkeypatch.chdir(tmp_path)
+    from_elsewhere = Settings().database_url
+    assert from_elsewhere == from_repo_root

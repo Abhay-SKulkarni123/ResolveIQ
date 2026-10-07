@@ -8,6 +8,7 @@ mode string rather than a value (NEP-09).
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -17,6 +18,21 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 #: Database used by the migration integration tests. It is disposable:
 #: `alembic downgrade base` drops every table in it.
 TEST_DATABASE_NAME = "resolveiq_test"
+
+#: The repository root: the parent of ``backend/``.
+#:
+#: Resolved from this file's own location rather than from the working directory.
+#: The repository keeps a single ``.env`` at its root while commands are run from
+#: ``backend/``, from the repository root, through uvicorn, through Alembic and
+#: through pytest; a path relative to the current directory would find a different
+#: file in each of those cases, and find none at all from anywhere else. Anchoring
+#: here means every entry point resolves the same file.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: The one canonical local environment file. ``.env`` is gitignored; there is
+#: deliberately no ``backend/.env``, so there is no second copy to fall out of
+#: sync with the first.
+DOTENV_PATH = REPO_ROOT / ".env"
 
 
 def _sibling_database_url(url: str, database_name: str) -> str:
@@ -31,12 +47,27 @@ def _sibling_database_url(url: str, database_name: str) -> str:
 
 
 class Settings(BaseSettings):
+    """Typed settings with one documented source of truth.
+
+    Precedence, highest first — this is pydantic-settings' own order and nothing
+    in this repository adds to or reorders it:
+
+    1. keyword arguments to ``Settings(...)`` — what the tests use, so they never
+       read a developer's ``.env`` by accident;
+    2. real environment variables — what a process manager or a CI step sets;
+    3. ``.env`` at the repository root (``DOTENV_PATH`` above).
+
+    ``docker-compose.yml`` keeps its own ``environment:`` block for the ``api``
+    service, and Compose gives that precedence over ``env_file:``, so a container
+    still gets the Docker service name while a process started on the host gets
+    whatever the root ``.env`` says. Local development therefore cannot inherit a
+    Docker-only hostname by accident.
+    """
+
     model_config = SettingsConfigDict(
-        # The repository keeps `.env` at its root while every command runs from
-        # `backend/`, so a bare ".env" would never be found.
-        # Later entries win in pydantic-settings, so a backend-local file still
-        # overrides the shared one.
-        env_file=("../.env", ".env"),
+        # An absolute path computed from __file__, so the same file is read
+        # whatever the current working directory happens to be.
+        env_file=str(DOTENV_PATH),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,

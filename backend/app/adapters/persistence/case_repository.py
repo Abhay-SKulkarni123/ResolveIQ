@@ -175,7 +175,14 @@ class SqlAlchemyCaseRepository:
     # ------------------------------------------------------------------
 
     def save(self, case: DisputeCase, *, expected_version: int) -> None:
-        """Persist the aggregate, inserting what is new and never rewriting what is not."""
+        """Persist the aggregate, inserting what is new and never rewriting what is not.
+
+        Child rows are written before the conditional update of ``disputes``. The
+        update is a core statement, so it executes the moment it is issued and
+        never joins the unit of work's dependency ordering; if it ran first it
+        would set ``current_investigation_id`` to an id whose row has not been
+        inserted yet, which the foreign key rejects.
+        """
         existing = self._session.get(DisputeRow, case.id)
         if expected_version == 0:
             if existing is not None:
@@ -183,16 +190,26 @@ class SqlAlchemyCaseRepository:
                     f"dispute {case.id} already exists; expected a create"
                 )
             self._insert_case(case)
+            self._insert_new_rows(case)
         else:
             if existing is None:
                 raise CaseNotFoundError(f"no dispute with id {case.id}")
+            self._insert_new_rows(case)
             self._update_case(existing, case, expected_version)
+            self._session.flush()
 
+    def _insert_new_rows(self, case: DisputeCase) -> None:
+        """Write evidence, investigations and reviews, then settle the new rows.
+
+        ``_insert_investigation`` flushes as it goes so that run and subtree are
+        written parent-first; this flush then settles them in the transaction and is
+        what lets ``_update_case`` (which runs afterwards) point at a row that
+        exists.
+        """
         self._insert_new_evidence(case)
         evidence_ids = self._evidence_id_map(case)
         self._insert_new_investigations(case, evidence_ids)
         self._insert_new_reviews(case)
-
         self._session.flush()
 
     def _insert_case(self, case: DisputeCase) -> None:
@@ -274,7 +291,7 @@ class SqlAlchemyCaseRepository:
                 "evidence_type": item.evidence_type.value,
                 "natural_key": item.natural_key,
                 "content_hash": item.content_hash,
-                "snapshot": dict(item.snapshot),
+                "snapshot": thaw_json(item.snapshot),
                 "captured_at": case.created_at,
             }
             for item_id, item in _evidence_with_ids(case)
@@ -347,13 +364,18 @@ class SqlAlchemyCaseRepository:
                 model=investigation.model,
                 prompt_version=investigation.prompt_version,
                 engine_version=investigation.engine_version,
-                stage_status=dict(investigation.stage_status),
+                stage_status=thaw_json(investigation.stage_status),
                 degradations=list(investigation.degradations),
                 stale_at=investigation.stale_at,
                 expires_at=investigation.expires_at,
                 created_at=investigation.created_at,
             )
         )
+        # Every row below points at this one. The mappers carry no relationship(),
+        # so the unit of work has no dependency to sort on and would emit the
+        # children first; the foreign keys reject that. One flush here buys the
+        # ordering explicitly, inside the same transaction.
+        self._session.flush()
 
         if investigation.calculation is not None:
             calculation = investigation.calculation
@@ -382,10 +404,10 @@ class SqlAlchemyCaseRepository:
                     is_complete=calculation.is_complete,
                     is_provisional=calculation.is_provisional,
                     unresolved_metrics=list(calculation.unresolved_metrics),
-                    trace=dict(calculation.trace),
-                    invoice=dict(calculation.invoice),
-                    balance=dict(calculation.balance),
-                    usage_summaries=[dict(u) for u in calculation.usage_summaries],
+                    trace=thaw_json(calculation.trace),
+                    invoice=thaw_json(calculation.invoice),
+                    balance=thaw_json(calculation.balance),
+                    usage_summaries=[thaw_json(u) for u in calculation.usage_summaries],
                     created_at=investigation.created_at,
                 )
             )
@@ -439,7 +461,7 @@ class SqlAlchemyCaseRepository:
                     impact_currency=hypothesis.impact_currency,
                     impact_basis=hypothesis.impact_basis,
                     not_assessable_reason=hypothesis.not_assessable_reason,
-                    impact_trace=dict(hypothesis.impact_trace),
+                    impact_trace=thaw_json(hypothesis.impact_trace),
                     created_at=investigation.created_at,
                 )
             )

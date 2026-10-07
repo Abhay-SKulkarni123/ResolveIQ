@@ -75,6 +75,7 @@ from app.domain.cases import (
 )
 from app.domain.evidence import EvidenceItem
 from app.domain.hypotheses import HypothesisCode
+from app.domain.json_frozen import thaw_json
 from app.ports.cases import CaseConflictError, CaseRepository
 from app.ports.llm import LlmProvider
 from app.services.citations import EvidenceCitationValidator
@@ -321,7 +322,7 @@ class CaseService:
         Returns the case unchanged, without writing, when nothing was new.
         """
         case = self._repository.get(dispute_id)
-        document = dict(case.source_document)
+        document = thaw_json(case.source_document)
         if not document or not document.get("present"):
             raise CaseNotInvestigableError(
                 f"case {case.external_id} has no stored invoice, so evidence cannot be attached"
