@@ -16,15 +16,20 @@ Implemented here
 ``POST   /disputes/{id}/evidence``    attach records or snapshots (idempotent)
 ``POST   /disputes/{id}/investigations`` start a run
 ``POST   /disputes/{id}/review``      record a reviewer annotation
+``POST   /disputes/{id}/decision``    close the case: RESOLVED or REJECTED
 ``POST   /disputes/{id}/reopen``      reopen a closed case
+``GET    /disputes/{id}/audit``       the case's history, oldest-first
 ``GET    /capabilities``              provider mode and which store is live
 ===================================== ==========================================
 
-Deliberately absent: ``/adjustments`` and anything that approves. Approval moves money
-and needs the idempotency key, the unique constraint and the separation-of-duties rules
-of §9.3 as one unit. Shipping the annotation endpoint now and the decision endpoint
-with its guards later is the split; shipping the button without the guards is not a
-split, it is an incident.
+Deliberately absent: ``/adjustments`` and anything that approves or moves money.
+Approval needs the idempotency key, the unique constraint and the
+separation-of-duties rules of §9.3 as one unit. The decision endpoint is *not* one
+of those: it records the closing verdict (``RESOLVED``/``REJECTED``), a judgement
+over the run under review, and carries no amount. The split is shipping the
+verdict and its reviewer-role gate now, and shipping the money movement with its
+guards later; shipping the button without the guards is not a split, it is an
+incident.
 
 Where the money boundary is enforced
 ------------------------------------
@@ -43,13 +48,17 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query, status
 
-from app.api.deps import ActorDep, CaseServiceDep, SettingsDep
+from app.api.deps import ActorDep, CaseServiceDep, IdempotencyKeyDep, SettingsDep
 from app.api.errors import ApiError
 from app.api.schemas import (
     AttachEvidenceRequest,
+    AuditEventResponse,
+    AuditHistoryResponse,
     CalculationResponse,
     CaseListResponse,
     CaseSummaryResponse,
+    DecisionRequest,
+    DecisionResponse,
     DisputeDetailResponse,
     EvidenceResponse,
     FindingResponse,
@@ -62,6 +71,7 @@ from app.api.schemas import (
     ReviewRequest,
     ReviewResponse,
 )
+from app.domain.audit import AuditEvent
 from app.domain.billing import (
     Adjustment,
     InvoiceLine,
@@ -77,6 +87,7 @@ from app.domain.billing import (
 from app.domain.cases import (
     CaseSeverity,
     CaseStatus,
+    DecisionKind,
     DisputeCase,
     InvestigationRecord,
     ReviewActionKind,
@@ -457,6 +468,44 @@ def _review_response(review: Any, case: DisputeCase) -> ReviewResponse:
     )
 
 
+def _decision_response(decision: Any) -> DecisionResponse:
+    """A closing verdict. Mirrors :class:`DisputeDecision`; no amount by design."""
+    return DecisionResponse(
+        id=str(decision.id),
+        investigation_id=str(decision.investigation_id),
+        decision=decision.decision.value,
+        actor_id=decision.actor_id,
+        actor_role=decision.actor_role,
+        rationale=decision.rationale,
+        evidence_fingerprint_seen=decision.evidence_fingerprint_seen,
+        created_at=decision.created_at,
+    )
+
+
+def _audit_response(event: AuditEvent) -> AuditEventResponse:
+    """One stored audit entry.
+
+    ``payload`` is thawed, not transformed: the audit row is the record, and this
+    only unwraps the frozen form the aggregate keeps so it can travel as JSON.
+    ``correlation_id`` is passed through as stored -- absent when the request carried
+    no idempotency key, which is information a reader can use.
+    """
+    return AuditEventResponse(
+        id=str(event.id),
+        event_type=event.event_type.value,
+        dispute_id=str(event.dispute_id),
+        occurred_at=event.occurred_at,
+        investigation_id=(
+            None if event.investigation_id is None else str(event.investigation_id)
+        ),
+        actor_id=event.actor_id,
+        actor_role=event.actor_role,
+        entity_version=event.entity_version,
+        correlation_id=event.correlation_id,
+        payload=thaw_json(event.payload),
+    )
+
+
 def _summary_response(case: DisputeCase) -> CaseSummaryResponse:
     current = case.current_investigation
     calculation = current.calculation if current else None
@@ -491,6 +540,7 @@ def _detail_response(case: DisputeCase) -> DisputeDetailResponse:
         ),
         investigations=[_investigation_response(run, case) for run in case.investigations],
         reviews=[_review_response(review, case) for review in case.reviews],
+        decisions=[_decision_response(decision) for decision in case.decisions],
     )
 
 
@@ -505,7 +555,12 @@ def _detail_response(case: DisputeCase) -> DisputeDetailResponse:
     response_model=DisputeDetailResponse,
     summary="Open a dispute case",
 )
-def create_dispute(payload: OpenDisputeRequest, service_dep: CaseServiceDep) -> DisputeDetailResponse:
+def create_dispute(
+    payload: OpenDisputeRequest,
+    service_dep: CaseServiceDep,
+    actor_dep: ActorDep,
+    idempotency_key_dep: IdempotencyKeyDep,
+) -> DisputeDetailResponse:
     """Open a case from its invoice, contract terms, usage, payments and adjustments.
 
     The whole payload arrives here because this is the only point at which these
@@ -514,8 +569,12 @@ def create_dispute(payload: OpenDisputeRequest, service_dep: CaseServiceDep) -> 
 
     Returns 201 with the full detail, including the evidence fingerprint, so a client
     does not need a second request to learn what it created.
+
+    Send an ``Idempotency-Key`` header and a retried delivery returns the case the
+    first delivery opened instead of opening a second one.
     """
     service, _ = service_dep
+    actor = actor_dep
     command = OpenCaseCommand(
         dispute_external_id=payload.dispute_external_id,
         invoice=_invoice(payload),
@@ -528,7 +587,14 @@ def create_dispute(payload: OpenDisputeRequest, service_dep: CaseServiceDep) -> 
         payments=_payments(payload.payments),
         adjustments=_adjustments(payload.adjustments),
     )
-    return _detail_response(service.open_case(command))
+    return _detail_response(
+        service.open_case(
+            command,
+            idempotency_key=idempotency_key_dep,
+            actor_id=actor.id,
+            actor_role=actor.role,
+        )
+    )
 
 
 @router.get("/disputes", response_model=CaseListResponse, summary="List dispute cases")
@@ -574,7 +640,10 @@ def get_dispute(dispute_id: str, service_dep: CaseServiceDep) -> DisputeDetailRe
     summary="Attach records or snapshots to a case",
 )
 def attach_evidence(
-    dispute_id: str, payload: AttachEvidenceRequest, service_dep: CaseServiceDep
+    dispute_id: str,
+    payload: AttachEvidenceRequest,
+    service_dep: CaseServiceDep,
+    actor_dep: ActorDep,
 ) -> DisputeDetailResponse:
     """Add evidence. Idempotent: re-sending the same records changes nothing.
 
@@ -591,6 +660,7 @@ def attach_evidence(
             "or snapshots.",
         )
     service, _ = service_dep
+    actor = actor_dep
     try:
         case = service.attach_records(
             _uuid(dispute_id, "dispute_id"),
@@ -599,6 +669,8 @@ def attach_evidence(
             payments=_payments(payload.payments),
             adjustments=_adjustments(payload.adjustments),
             snapshots=_snapshots(payload.snapshots),
+            actor_id=actor.id,
+            actor_role=actor.role,
         )
     except SourceDocumentError as exc:
         raise ApiError(422, "INVALID_EVIDENCE", str(exc)) from exc
@@ -612,7 +684,11 @@ def attach_evidence(
     summary="Run an investigation over the case's current evidence",
 )
 def create_investigation(
-    dispute_id: str, service_dep: CaseServiceDep, settings_dep: SettingsDep
+    dispute_id: str,
+    service_dep: CaseServiceDep,
+    settings_dep: SettingsDep,
+    actor_dep: ActorDep,
+    idempotency_key_dep: IdempotencyKeyDep,
 ) -> InvestigationResponse:
     """Start a run.
 
@@ -627,10 +703,16 @@ def create_investigation(
     designing for it now with a status code that would be wrong today.
     """
     service, _ = service_dep
+    actor = actor_dep
+    case_id = _uuid(dispute_id, "dispute_id")
     record = service.investigate(
-        _uuid(dispute_id, "dispute_id"), prompt_version=settings_dep.prompt_version
+        case_id,
+        prompt_version=settings_dep.prompt_version,
+        idempotency_key=idempotency_key_dep,
+        actor_id=actor.id,
+        actor_role=actor.role,
     )
-    return _investigation_response(record, service.get(_uuid(dispute_id, "dispute_id")))
+    return _investigation_response(record, service.get(case_id))
 
 
 @router.post(
@@ -640,7 +722,11 @@ def create_investigation(
     summary="Record a reviewer annotation on a finding, hypothesis or option",
 )
 def record_review(
-    dispute_id: str, payload: ReviewRequest, service_dep: CaseServiceDep, actor_dep: ActorDep
+    dispute_id: str,
+    payload: ReviewRequest,
+    service_dep: CaseServiceDep,
+    actor_dep: ActorDep,
+    idempotency_key_dep: IdempotencyKeyDep,
 ) -> ReviewResponse:
     """Accept, reject, request more information, or amend.
 
@@ -651,7 +737,8 @@ def record_review(
     the model said and the reader can no longer tell a model error from a preference.
 
     There is no ``approve`` action. Approving is a money decision and belongs with the
-    idempotency and separation-of-duties guards of §9.3.
+    idempotency and separation-of-duties guards of §9.3. Closing the case is a
+    separate verdict on ``/disputes/{id}/decision``.
     """
     service, _ = service_dep
     actor = actor_dep
@@ -667,11 +754,67 @@ def record_review(
             actor_role=actor.role,
             rationale=payload.rationale,
             amended_narrative=payload.amended_narrative,
+            idempotency_key=idempotency_key_dep,
         )
     except ValueError as exc:
         # ReviewAction's own invariants: AMEND without text, non-AMEND with it.
         raise ApiError(422, "INVALID_REVIEW", str(exc)) from exc
     return _review_response(review, service.get(dispute_uuid))
+
+
+@router.post(
+    "/disputes/{dispute_id}/decision",
+    status_code=status.HTTP_201_CREATED,
+    response_model=DecisionResponse,
+    summary="Close the case with a reviewer's verdict",
+)
+def decide_dispute(
+    dispute_id: str,
+    payload: DecisionRequest,
+    service_dep: CaseServiceDep,
+    actor_dep: ActorDep,
+    idempotency_key_dep: IdempotencyKeyDep,
+) -> DecisionResponse:
+    """Set the case to ``RESOLVED`` or ``REJECTED``.
+
+    The verdict is refused with 403 unless the caller is a reviewer -- the one
+    role-gated action in this surface -- and with 409 when the run under review is
+    stale, when it has not been reviewed at all, or when the case is no longer
+    awaiting review. The record moves no money: it is the verdict that closes the
+    lifecycle, and executing an adjustment is the idempotent resolution phase.
+    """
+    service, _ = service_dep
+    actor = actor_dep
+    if actor.role != "reviewer":
+        raise ApiError(
+            403,
+            "REVIEWER_REQUIRED",
+            "only a reviewer can decide a case; this request carried role "
+            f"{actor.role!r}",
+        )
+    dispute_uuid = _uuid(dispute_id, "dispute_id")
+    try:
+        case = service.decide(
+            dispute_uuid,
+            decision=DecisionKind(payload.decision),
+            actor_id=actor.id,
+            actor_role=actor.role,
+            rationale=payload.rationale,
+            idempotency_key=idempotency_key_dep,
+        )
+    except ValueError as exc:
+        # DisputeDecision's user-input invariants: non-blank rationale.
+        raise ApiError(422, "INVALID_DECISION", str(exc)) from exc
+    # On a replay the returned case may carry later decisions; answer for the key
+    # that was sent, falling back to the newest for the no-key path.
+    if idempotency_key_dep is not None:
+        decision = next(
+            (d for d in case.decisions if d.idempotency_key == idempotency_key_dep),
+            case.decisions[-1],
+        )
+    else:
+        decision = case.decisions[-1]
+    return _decision_response(decision)
 
 
 @router.post(
@@ -692,8 +835,41 @@ def reopen_dispute(
     service, _ = service_dep
     actor = actor_dep
     dispute_uuid = _uuid(dispute_id, "dispute_id")
-    case = service.reopen(dispute_uuid, reason=payload.reason, actor_id=actor.id)
+    case = service.reopen(
+        dispute_uuid, reason=payload.reason, actor_id=actor.id, actor_role=actor.role
+    )
     return _detail_response(case)
+
+
+@router.get(
+    "/disputes/{dispute_id}/audit",
+    response_model=AuditHistoryResponse,
+    summary="A case's audit trail, oldest-first",
+)
+def get_dispute_audit(
+    dispute_id: str,
+    service_dep: CaseServiceDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AuditHistoryResponse:
+    """The single ordered record of what happened to this case, and who did it.
+
+    Oldest-first, the reverse of the dispute list: a trail read newest-first is a
+    stack of unrelated events, and the question it exists to answer -- how did the
+    case get here? -- is only legible in order.
+
+    Reads only. Nothing here writes an event, and no event is ever edited: the trail
+    is the record, so a route that could change it would make it worth nothing.
+    """
+    service, _ = service_dep
+    dispute_uuid = _uuid(dispute_id, "dispute_id")
+    events = service.list_audit(dispute_uuid, limit=limit, offset=offset)
+    return AuditHistoryResponse(
+        items=[_audit_response(event) for event in events],
+        total=service.count_audit(dispute_uuid),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/capabilities", summary="Provider mode, store kind and feature flags")
@@ -723,8 +899,10 @@ def capabilities(
         "features": {
             "adjustments": False,
             "approval": False,
+            "case_decision": True,
             "reopen": True,
             "evidence_attachment": True,
             "review_annotations": True,
+            "audit_trail": True,
         },
     }

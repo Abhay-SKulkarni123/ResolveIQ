@@ -28,8 +28,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import replace
+from datetime import datetime
 from uuid import UUID
 
+from app.domain.audit import AuditEvent
 from app.domain.cases import CaseStatus, DisputeCase
 from app.ports.cases import CaseConflictError, CaseNotFoundError
 
@@ -42,6 +44,9 @@ class InMemoryCaseRepository:
     def __init__(self) -> None:
         self._cases: dict[UUID, DisputeCase] = {}
         self._by_external_id: dict[str, UUID] = {}
+        # One append-only list per dispute. The events are immutable, so the list
+        # holds the values themselves rather than copies.
+        self._audit: dict[UUID, list[AuditEvent]] = {}
         # Insertion order, for tie-breaking `list`. See the comment there.
         self._sequence: dict[UUID, int] = {}
         self._next_sequence = 0
@@ -69,6 +74,18 @@ class InMemoryCaseRepository:
         dispute_id = self._by_external_id.get(external_id)
         return None if dispute_id is None else self._cases[dispute_id]
 
+    def find_by_idempotency_key(self, key: str) -> DisputeCase | None:
+        """The case opened with ``key``, if any.
+
+        Only the case-level key is indexed here. Keys on runs, reviews and decisions
+        are searched inside a known aggregate by the service, which already holds the
+        dispute id, so there is nothing to index for them.
+        """
+        for candidate in self._cases.values():
+            if candidate.idempotency_key == key:
+                return candidate
+        return None
+
     def list(
         self, *, status: CaseStatus | None = None, limit: int = 50, offset: int = 0
     ) -> tuple[DisputeCase, ...]:
@@ -91,6 +108,30 @@ class InMemoryCaseRepository:
 
     def count(self, *, status: CaseStatus | None = None) -> int:
         return sum(1 for case in self._cases.values() if status is None or case.status is status)
+
+    def list_audit(
+        self, dispute_id: UUID, *, limit: int = 50, offset: int = 0
+    ) -> tuple[AuditEvent, ...]:
+        """Oldest-first, ordered by ``(occurred_at, entity_version, id)``.
+
+        The SQL adapter sorts on the same three keys. ``entity_version`` recovers the
+        order of operations that share one clock tick (the service always sets it to
+        the case version, which rises by one per change); ``id`` is the final tiebreak
+        and is reproduced by ``str(uuid)``, which orders the same way as the raw 16
+        bytes both engines store.
+        """
+        events = sorted(
+            self._audit.get(dispute_id, []),
+            key=lambda event: (
+                event.occurred_at,
+                event.entity_version or 0,
+                str(event.id),
+            ),
+        )
+        return tuple(events[offset : offset + limit])
+
+    def count_audit(self, dispute_id: UUID) -> int:
+        return len(self._audit.get(dispute_id, []))
 
     def __iter__(self) -> Iterator[DisputeCase]:
         """Iterate stored cases. Test convenience; not part of the port."""
@@ -135,3 +176,28 @@ class InMemoryCaseRepository:
         self._by_external_id[case.external_id] = case.id
         if previous_external is not None and previous_external != case.external_id:
             del self._by_external_id[previous_external]
+
+    def begin_investigation(self, case: DisputeCase, *, expected_version: int) -> None:
+        """Write the pending marker.
+
+        In memory there is no transaction to commit, so this is :meth:`save`. The
+        durability the SQL adapter buys with an immediate commit has no analogue here,
+        and nothing may rely on it: the in-memory store is not durability and never was.
+        """
+        self.save(case, expected_version=expected_version)
+
+    def list_pending_investigations(
+        self, *, started_before: datetime
+    ) -> tuple[tuple[UUID, UUID], ...]:
+        """Pending runs started before ``started_before``, oldest-first."""
+        pending: list[tuple[UUID, UUID, datetime]] = []
+        for case in self._cases.values():
+            for run in case.investigations:
+                if run.is_pending and run.created_at < started_before:
+                    pending.append((case.id, run.id, run.created_at))
+        pending.sort(key=lambda row: (row[2], str(row[1])))
+        return tuple((dispute_id, investigation_id) for dispute_id, investigation_id, _ in pending)
+
+    def append_audit(self, event: AuditEvent) -> None:
+        """Append one event. No update path exists, which is the point."""
+        self._audit.setdefault(event.dispute_id, []).append(event)

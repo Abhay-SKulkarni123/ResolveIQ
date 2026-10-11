@@ -23,15 +23,19 @@ request also gives §10's "no partial writes" for free: a case and its investiga
 become durable together or not at all.
 
 **Identity is a header and is labelled as such.** ``X-Actor-Id`` and ``X-Actor-Role``
-are read from the request and stored as a label on a review annotation. They are not
+are read from the request and stored as a label on each annotation. They are not
 authentication (OQ-01): trivially spoofable, no signature, no session. The role is
-recorded so a reviewer can see who claimed what, and it is **not** consulted for any
-authorisation decision -- separation of duties is a later phase, and a role check
-built on a spoofable header would appear to work and would not.
+recorded so a reviewer can see who claimed what. It is consulted in exactly one
+place -- the decision endpoint insists it say ``reviewer``, because a closing verdict
+is the one action that permanently changes the lifecycle -- and everywhere else it is
+**not** consulted for any authorisation decision: separation of duties beyond that
+single gate is a later phase, and a role check built on a spoofable header would
+appear to work and would not.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Annotated
@@ -44,10 +48,24 @@ from app.adapters.persistence.case_repository import SqlAlchemyCaseRepository
 from app.adapters.persistence.database import get_sessionmaker
 from app.adapters.persistence.memory_case_repository import InMemoryCaseRepository
 from app.config import Settings, get_settings
+from app.logging_config import error_category, log_event
+from app.ports.cases import CaseRepository
 from app.ports.llm import LlmProvider
 from app.services.cases import CaseService
 
-__all__ = ["Actor", "CaseServiceDep", "SettingsDep", "StoreKind", "actor", "settings", "store_kind"]
+__all__ = [
+    "Actor",
+    "CaseServiceDep",
+    "IdempotencyKeyDep",
+    "SettingsDep",
+    "StoreKind",
+    "actor",
+    "idempotency_key",
+    "settings",
+    "store_kind",
+]
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +73,9 @@ class Actor:
     """Who the request claims to be.
 
     A record of a claim, nothing more. ``role`` is carried so it can be displayed and
-    stored; no route checks it, and a future authorisation layer must not inherit it
-    from here by accident.
+    stored, and it is consulted in exactly one place (the decision route's reviewer
+    gate); a future authorisation layer must not inherit it as an authority -- it is
+    still a spoofable header.
     """
 
     id: str
@@ -116,6 +135,23 @@ def _identity_invalid(message: str) -> Exception:
     return ApiError(422, "INVALID_IDENTITY", message)
 
 
+def idempotency_key(
+    value: Annotated[str | None, Header(alias="Idempotency-Key", max_length=255)] = None,
+) -> str | None:
+    """The client's idempotency token for this request, or ``None``.
+
+    A header rather than a body field because it names the *request*, not the
+    resource: two logically identical bodies with different keys are two operations,
+    and the same key with a changed body is a client error the store will not catch.
+    Blank and whitespace-only values collapse to ``None`` so they cannot be stored as
+    a key that no retry could ever match.
+    """
+    if value is None:
+        return None
+    key = value.strip()
+    return key or None
+
+
 def build_provider(settings_dep: Settings) -> LlmProvider:
     """The configured model provider.
 
@@ -153,19 +189,38 @@ def case_service(
     routes have one signature rather than two.
     """
     provider = build_provider(settings_dep)
+
+    def build_service(repository: CaseRepository) -> CaseService:
+        return CaseService(
+            repository,
+            provider,
+            max_attempts=settings_dep.investigation_max_attempts,
+            investigation_ttl_hours=settings_dep.investigation_ttl_hours,
+        )
+
     if settings_dep.case_store == "memory":
-        yield CaseService(memory_repository(request), provider), "memory"
+        yield build_service(memory_repository(request)), "memory"
         return
 
     session: Session = get_sessionmaker()()
     try:
-        yield CaseService(SqlAlchemyCaseRepository(session), provider), "postgres"
+        yield build_service(SqlAlchemyCaseRepository(session)), "postgres"
         # Commit only after the route returned cleanly. A route that raises after a
         # successful ``save`` leaves nothing behind, so a caller that retries cannot
         # find a half-written case.
         session.commit()
-    except Exception:
+    except Exception as exc:
+        # Recorded at ``WARNING`` because a rolled-back transaction is a request that
+        # did not do what it asked and a client is about to get a 5xx. The exception
+        # message is not logged, only its category: it can carry request data.
         session.rollback()
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "db.transaction.rolledback",
+            store="postgres",
+            error_category=error_category(exc),
+        )
         raise
     finally:
         session.close()
@@ -174,3 +229,4 @@ def case_service(
 SettingsDep = Annotated[Settings, Depends(settings)]
 ActorDep = Annotated[Actor, Depends(actor)]
 CaseServiceDep = Annotated[tuple[CaseService, StoreKind], Depends(case_service)]
+IdempotencyKeyDep = Annotated[str | None, Depends(idempotency_key)]

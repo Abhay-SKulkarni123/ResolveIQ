@@ -36,8 +36,8 @@ DIALECT = postgresql.dialect()
 #: Phase 1-2: the source-of-truth tables imported from the billing system.
 SOURCE_TABLES = {"accounts", "contracts", "contract_price_terms"}
 
-#: Phase 4: disputes, their immutable evidence, calculations, investigations and the
-#: reviewer's annotations.
+#: Phase 4: disputes, their immutable evidence, calculations, investigations, the
+#: reviewer's annotations, and the closing verdict.
 DISPUTE_TABLES = {
     "disputes",
     "dispute_evidence_items",
@@ -48,9 +48,15 @@ DISPUTE_TABLES = {
     "investigation_hypotheses",
     "investigation_resolution_options",
     "finding_reviews",
+    "dispute_decisions",
 }
 
-EXPECTED_TABLES = SOURCE_TABLES | DISPUTE_TABLES
+#: The completion pass: the append-only record of what happened to a case. Kept
+#: apart from ``DISPUTE_TABLES`` because it is a cross-cutting concern with its own
+#: module, not one of the aggregate's Phase 4 tables.
+AUDIT_TABLES = {"audit_events"}
+
+EXPECTED_TABLES = SOURCE_TABLES | DISPUTE_TABLES | AUDIT_TABLES
 
 #: The join table between an investigation and the snapshots it read. It has a
 #: composite primary key of the two foreign keys and no surrogate ``id``: the pair
@@ -339,13 +345,18 @@ def test_foreign_key_names_are_deterministic() -> None:
         "fk_investigations_dispute_id_disputes",
         "fk_investigation_evidence_investigation_id_investigations",
         "fk_investigation_findings_investigation_id_investigations",
-        "fk_investigation_hypotheses_investigation_id_investigations",
-        "fk_finding_reviews_dispute_id_disputes",
-        "fk_finding_reviews_investigation_id_investigations",
+"fk_investigation_hypotheses_investigation_id_investigations",
+            "fk_finding_reviews_dispute_id_disputes",
+            "fk_finding_reviews_investigation_id_investigations",
+        "fk_dispute_decisions_dispute_id_disputes",
+        "fk_dispute_decisions_investigation_id_investigations",
+        # The completion pass
+        "fk_audit_events_dispute_id_disputes",
+        "fk_audit_events_investigation_id_investigations",
         # The two documented short-name exceptions (over 63 bytes if conventional).
-        "fk_investigation_evidence_evidence_item_id_evidence",
-        "fk_investigation_resolution_options_investigation_id",
-    }
+            "fk_investigation_evidence_evidence_item_id_evidence",
+            "fk_investigation_resolution_options_investigation_id",
+        }
 
 
 def test_foreign_key_names_fit_postgresql_identifier_limit() -> None:

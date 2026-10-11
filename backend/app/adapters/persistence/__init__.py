@@ -12,6 +12,7 @@ the same event.
 
 from __future__ import annotations
 
+from app.adapters.persistence.audit_models import AuditEventRow
 from app.adapters.persistence.base import (
     NAMING_CONVENTION,
     Base,
@@ -58,6 +59,7 @@ __all__ = [
     "QUANTITY_PRECISION",
     "QUANTITY_SCALE",
     "Account",
+    "AuditEventRow",
     "Base",
     "CalculationRow",
     "Contract",

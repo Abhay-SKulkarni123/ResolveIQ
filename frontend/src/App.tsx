@@ -90,6 +90,7 @@ export function App() {
           <CaseDetailView
             key={`${route.id}-${revision}`}
             caseId={route.id}
+            actorRole={capabilities?.identity.actor_role ?? 'reviewer'}
             onChanged={() => setRevision((value) => value + 1)}
           />
         )}

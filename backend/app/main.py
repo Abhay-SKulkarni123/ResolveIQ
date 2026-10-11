@@ -22,14 +22,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import install_error_handlers
+from app.api.middleware import RequestContextMiddleware
 from app.api.routes import router as cases_router
 from app.config import get_settings
+from app.logging_config import configure_logging
 
 __all__ = ["app", "create_app"]
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    configure_logging(settings)
 
     application = FastAPI(
         title="ResolveIQ API",
@@ -49,6 +52,10 @@ def create_app() -> FastAPI:
         # yet, and a header nobody sends cannot be relied on.
         allow_headers=["Content-Type", "Idempotency-Key", "X-Actor-Id", "X-Actor-Role"],
     )
+
+    # Added last, so it is the outermost middleware and the correlation header is
+    # present on every response the application produces, error responses included.
+    application.add_middleware(RequestContextMiddleware)
 
     install_error_handlers(application)
     application.include_router(cases_router)

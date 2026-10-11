@@ -46,7 +46,7 @@ from typing import Any, Final
 from uuid import UUID
 
 from app.domain.evidence import EvidenceBundle, EvidenceItem, EvidenceType, canonical_json
-from app.domain.investigation import InvestigationStatus
+from app.domain.investigation import InvestigationStage, InvestigationStatus
 from app.domain.json_frozen import freeze_json, thaw_json
 
 __all__ = [
@@ -55,7 +55,9 @@ __all__ = [
     "CaseSeverity",
     "CaseStatus",
     "CaseTransitionError",
+    "DecisionKind",
     "DisputeCase",
+    "DisputeDecision",
     "InvestigationRecord",
     "InvestigationRunStatus",
     "ReviewAction",
@@ -80,6 +82,48 @@ AMOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^-?\d+(\.\d+)?$")
 _CASE_SEVERITIES: Final[frozenset[str]] = frozenset({"LOW", "MEDIUM", "HIGH", "CRITICAL"})
 
 _EXTERNAL_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,63}$")
+
+#: Longest idempotency key the schema stores (``Idempotency-Key`` header). A key is
+#: an opaque client token, so it is kept as-is apart from trimming; length is bounded
+#: only because the column is ``VARCHAR(255)``.
+IDEMPOTENCY_KEY_MAX_LENGTH: Final[int] = 255
+
+#: The workflow stages in the order they must complete, used to answer "where does a
+#: recovery resume from". Derived from :class:`~app.domain.investigation.InvestigationStage`
+#: so the two vocabularies cannot drift.
+_STAGE_ORDER: Final[tuple[str, ...]] = (
+    InvestigationStage.COLLECTING_EVIDENCE.value,
+    InvestigationStage.INTERPRETING.value,
+    InvestigationStage.COMPUTING_IMPACT.value,
+    InvestigationStage.PROPOSING_RESOLUTIONS.value,
+)
+
+#: The marker a stage carries once it has finished. Anything else means "not done".
+_STAGE_COMPLETE: Final[str] = "COMPLETE"
+
+
+def _normalise_idempotency_key(value: str | None) -> str | None:
+    """Trim an idempotency key, treating blank as absent.
+
+    ``None`` and an empty string both mean "the caller did not supply a key", so
+    they are collapsed to ``None``: otherwise ``""`` and ``"  "`` would each be
+    stored and each be a distinct key that no retry could ever match. A key that
+    is too long is rejected here rather than truncated, because truncation would
+    silently make two different keys collide.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"idempotency_key must be a string or None, got {type(value).__name__}")
+    key = value.strip()
+    if not key:
+        return None
+    if len(key) > IDEMPOTENCY_KEY_MAX_LENGTH:
+        raise ValueError(
+            f"idempotency_key must be at most {IDEMPOTENCY_KEY_MAX_LENGTH} characters, "
+            f"got {len(key)}"
+        )
+    return key
 
 
 class CaseTransitionError(Exception):
@@ -138,15 +182,24 @@ class InvestigationRunStatus(str, Enum):
 
     ``PENDING`` is added here because a row is written when an investigation
     starts, not when it finishes; Phase 3's ``InvestigationStatus`` only ever
-    described finished runs. The three terminal members mirror
-    ``InvestigationStatus`` exactly rather than widening it, so a stored row can
-    be checked against the Phase 3 enum it came from.
+    described finished runs. The three terminal members that mirror
+    ``InvestigationStatus`` (``COMPLETE``/``DEGRADED``/``PARTIAL_FAILED``) are
+    reached by the workflow; ``FAILED`` is the fourth terminal member and is
+    reached only by recovery.
+
+    ``FAILED`` is deliberately *not* an ``InvestigationStatus``: the workflow
+    never produces it. It exists so a PENDING row abandoned by a crashed
+    process, an exhausted retry budget or an expired TTL can be brought to a
+    terminal state without inventing an interpretation that was never
+    produced. A run that ends here has no findings, no calculation and no
+    currency; it is a tombstone, not an answer.
     """
 
     PENDING = "PENDING"
     COMPLETE = "COMPLETE"
     DEGRADED = "DEGRADED"
     PARTIAL_FAILED = "PARTIAL_FAILED"
+    FAILED = "FAILED"
 
     @property
     def is_terminal(self) -> bool:
@@ -177,15 +230,32 @@ class ReviewTargetType(str, Enum):
 class ReviewActionKind(str, Enum):
     """Reviewer verbs for Phase 4.
 
-    ``APPROVE`` is deliberately absent. Approving is a money decision and belongs
-    to the phase that also brings idempotency and separation of duties; offering
-    it now would mean shipping the button without the guard behind it.
+    ``APPROVE`` is deliberately absent *here*. Approving and moving money is the
+    idempotency phase (Part 4 of the completion pass); what this vocabulary records
+    is a reviewer's annotation, not a verdict. The verdict that closes a case is a
+    separate kind (:class:`DecisionKind`), which sets ``RESOLVED``/``REJECTED`` and
+    moves no money either.
     """
 
     ACCEPT = "ACCEPT"
     REJECT = "REJECT"
     REQUEST_MORE_INFO = "REQUEST_MORE_INFO"
     AMEND = "AMEND"
+
+
+class DecisionKind(str, Enum):
+    """The two verdicts that close a case's lifecycle.
+
+    Values deliberately shadow the resulting :class:`CaseStatus` members, so
+    ``CaseStatus(decision.value)`` is the status a decided case moves to and the
+    mapping cannot drift. A decision is not an instruction to move money: it is
+    the recorded judgement that the reviewed run settles the dispute (``RESOLVED``)
+    or that it does not (``REJECTED``). Applying an amount or executing an
+    adjustment belongs to the idempotent resolution phase.
+    """
+
+    RESOLVED = "RESOLVED"
+    REJECTED = "REJECTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,6 +455,9 @@ class InvestigationRecord:
     stage_status: Mapping[str, Any] = field(default_factory=dict)
     stale_at: datetime | None = None
     expires_at: datetime | None = None
+    #: The ``Idempotency-Key`` that created this run, kept so a retried request can be
+    #: answered with this run instead of starting a second one. Unique per key.
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.version < 1:
@@ -396,6 +469,9 @@ class InvestigationRecord:
         object.__setattr__(self, "resolution_options", tuple(self.resolution_options))
         object.__setattr__(self, "degradations", tuple(self.degradations))
         object.__setattr__(self, "stage_status", freeze_json(self.stage_status))
+        object.__setattr__(
+            self, "idempotency_key", _normalise_idempotency_key(self.idempotency_key)
+        )
 
     @property
     def is_stale(self) -> bool:
@@ -405,6 +481,66 @@ class InvestigationRecord:
     def has_impact(self) -> bool:
         """True when at least one hypothesis carries a quantified impact."""
         return any(h.impact_decimal is not None for h in self.hypotheses)
+
+    # ------------------------------------------------------------------
+    # recovery state
+    # ------------------------------------------------------------------
+    #
+    # A run's per-stage status, its attempt count and its failure reason live inside
+    # the ``stage_status`` JSON mapping rather than in dedicated columns. The mapping is
+    # already persisted and already frozen; dedicated columns would need a migration and
+    # a new CHECK constraint for facts that only the recovery path reads. The accessors
+    # below are the only readers, so the shape is documented in one place:
+    #
+    #   {"overall": "PENDING", "stages": {"COLLECTING_EVIDENCE": "COMPLETE", ...},
+    #    "attempts": 2, "failure_reason": null}
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status is InvestigationRunStatus.PENDING
+
+    @property
+    def attempts(self) -> int:
+        """How many workflow attempts this run has made (always at least 1)."""
+        value = self.stage_status.get("attempts", 1)
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else 1
+
+    @property
+    def failure_reason(self) -> str | None:
+        """Why the run is terminal-but-failed, or ``None`` for any other state."""
+        value = self.stage_status.get("failure_reason")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def resume_from(self) -> str | None:
+        """The first stage that has not completed, if the run can be resumed.
+
+        ``None`` when every stage is complete, which is the normal case for a run that
+        reached a terminal status by finishing. A ``PENDING`` run with no recorded stages
+        resumes from the very beginning.
+        """
+        stages = self.stage_status.get("stages")
+        if not isinstance(stages, Mapping):
+            return _STAGE_ORDER[0]
+        for stage in _STAGE_ORDER:
+            if stages.get(stage) != _STAGE_COMPLETE:
+                return stage
+        return None
+
+    def is_expired(self, now: datetime) -> bool:
+        """Whether the run's TTL has elapsed at ``now``.
+
+        A run with no ``expires_at`` never expires: the TTL is opt-in and an unbounded
+        run is a legitimate configuration, not a bug.
+        """
+        return self.expires_at is not None and self.expires_at <= now
+
+    def with_attempt(self, attempts: int) -> InvestigationRecord:
+        """Return a copy recording ``attempts`` made so far."""
+        if attempts < 1:
+            raise ValueError(f"attempts must be >= 1, got {attempts}")
+        state = {**dict(self.stage_status), "attempts": attempts}
+        return replace(self, stage_status=state)
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +566,7 @@ class ReviewAction:
     created_at: datetime
     rationale: str = ""
     amended_narrative: str | None = None
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.action is ReviewActionKind.AMEND and not (self.amended_narrative or "").strip():
@@ -441,6 +578,44 @@ class ReviewAction:
         # time, when the caller no longer holds the object that needs fixing.
         if not self.actor_id.strip():
             raise ValueError("review requires a non-blank actor_id")
+        object.__setattr__(
+            self, "idempotency_key", _normalise_idempotency_key(self.idempotency_key)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DisputeDecision:
+    """A reviewer's closing verdict on the case.
+
+    Append-only, like every other recorded judgement. ``investigation_id`` names
+    the run that was under review when the verdict was made and
+    ``evidence_fingerprint_seen`` the evidence that run read, so a later reader can
+    tell exactly what the verdict was based on.
+
+    Explicitly not an approval that moves money. ``decision`` closes the lifecycle
+    (``RESOLVED``/``REJECTED``); executing an amount is the idempotency phase and
+    is deliberately a separate record with its own guards.
+    """
+
+    id: UUID
+    dispute_id: UUID
+    investigation_id: UUID
+    decision: DecisionKind
+    actor_id: str
+    actor_role: str
+    evidence_fingerprint_seen: str
+    rationale: str
+    created_at: datetime
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.actor_id.strip():
+            raise ValueError("a decision requires a non-blank actor_id")
+        if not self.rationale.strip():
+            raise ValueError("a decision requires a non-blank rationale")
+        object.__setattr__(
+            self, "idempotency_key", _normalise_idempotency_key(self.idempotency_key)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +647,7 @@ class DisputeCase:
     current_investigation_id: UUID | None = None
     investigations: tuple[InvestigationRecord, ...] = ()
     reviews: tuple[ReviewAction, ...] = ()
+    decisions: tuple[DisputeDecision, ...] = ()
     #: The validated ingest payload the evidence was built from: the invoice,
     #: contract terms, usage, payments and adjustments as the domain types
     #: serialise them.
@@ -488,6 +664,9 @@ class DisputeCase:
     #: rather than inventing one.
     source_document: Mapping[str, Any] = field(default_factory=dict)
     version: int = 1
+    #: The ``Idempotency-Key`` the case was opened with, if any. Set once at creation
+    #: and never rewritten; a retried "open dispute" replays the stored case instead.
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         if not _EXTERNAL_ID_PATTERN.match(self.external_id):
@@ -498,8 +677,12 @@ class DisputeCase:
             raise ValueError(f"unknown severity: {self.severity!r}")
         object.__setattr__(self, "investigations", tuple(self.investigations))
         object.__setattr__(self, "reviews", tuple(self.reviews))
+        object.__setattr__(self, "decisions", tuple(self.decisions))
         object.__setattr__(self, "source_document", freeze_json(self.source_document))
         object.__setattr__(self, "version", int(self.version))
+        object.__setattr__(
+            self, "idempotency_key", _normalise_idempotency_key(self.idempotency_key)
+        )
 
     @property
     def can_investigate(self) -> bool:
@@ -665,6 +848,143 @@ class DisputeCase:
             version=self.version + 1,
         )
 
+    # ------------------------------------------------------------------
+    # write-ahead investigation lifecycle (Part 7)
+    # ------------------------------------------------------------------
+
+    def with_pending_investigation(self, investigation: InvestigationRecord) -> DisputeCase:
+        """Record that an investigation has *started*, before any work is done.
+
+        This is the write-ahead half of the recovery design (ADR-008). The row is
+        persisted as ``PENDING`` and committed before the workflow runs, so a crash
+        mid-run leaves a durable trace of an unfinished investigation rather than no
+        trace at all. Only the terminal transition (:meth:`complete_investigation`)
+        bumps ``version``; a pending marker must not, or the optimistic-concurrency
+        token a caller holds from the previous response would be invalidated for a
+        request that has not yet changed the case's meaning.
+
+        Guards mirror :meth:`with_investigation`, plus one this path adds: a case may
+        hold at most one pending run at a time. Two concurrent starts would otherwise
+        both write a PENDING row and neither could be resolved deterministically.
+        """
+        if self.status in (CaseStatus.RESOLVED, CaseStatus.REJECTED):
+            raise CaseTransitionError(
+                f"case {self.external_id} is {self.status.value}; reopen it before investigating"
+            )
+        if investigation.status is not InvestigationRunStatus.PENDING:
+            raise CaseTransitionError("a write-ahead investigation must be PENDING")
+        if investigation.dispute_id != self.id:
+            raise CaseTransitionError("investigation belongs to a different dispute")
+        if investigation.evidence_fingerprint != self.evidence_fingerprint:
+            raise CaseTransitionError(
+                "investigation was produced from evidence that is no longer attached to the case"
+            )
+        if any(run.is_pending for run in self.investigations):
+            raise CaseTransitionError("this case already has a pending investigation")
+        if investigation.version != self.next_investigation_version:
+            raise CaseTransitionError(
+                f"expected investigation version {self.next_investigation_version}, "
+                f"got {investigation.version}"
+            )
+        return replace(
+            self,
+            investigations=(*self.investigations, investigation),
+            status=CaseStatus.INVESTIGATING,
+        )
+
+    def complete_investigation(self, investigation: InvestigationRecord) -> DisputeCase:
+        """Replace a pending run with its terminal result and move the case to review.
+
+        The one-way PENDING → terminal edge is enforced here: a run that is not pending
+        cannot be completed twice, so a replayed completion is a refusal rather than a
+        duplicate finding set. ``version`` advances by one, exactly as it did when
+        :meth:`with_investigation` attached a finished run in one step.
+        """
+        if not investigation.status.is_terminal:
+            raise CaseTransitionError("a completed investigation must be terminal")
+        index = next(
+            (i for i, run in enumerate(self.investigations) if run.id == investigation.id),
+            None,
+        )
+        if index is None:
+            raise CaseTransitionError(
+                f"investigation {investigation.id} is not part of this case"
+            )
+        existing = self.investigations[index]
+        if existing.status is not InvestigationRunStatus.PENDING:
+            raise CaseTransitionError(
+                "only a pending investigation can be completed; "
+                f"{investigation.id} is {existing.status.value}"
+            )
+        if investigation.version != existing.version:
+            raise CaseTransitionError(
+                f"completed investigation must keep version {existing.version}, "
+                f"got {investigation.version}"
+            )
+        if investigation.dispute_id != self.id:
+            raise CaseTransitionError("investigation belongs to a different dispute")
+        if investigation.evidence_fingerprint != self.evidence_fingerprint:
+            raise CaseTransitionError(
+                "investigation was produced from evidence that is no longer attached to the case"
+            )
+        investigations = (
+            *self.investigations[:index],
+            investigation,
+            *self.investigations[index + 1 :],
+        )
+        return replace(
+            self,
+            investigations=investigations,
+            current_investigation_id=investigation.id,
+            status=CaseStatus.AWAITING_REVIEW,
+            version=self.version + 1,
+        )
+
+    def fail_investigation(self, investigation_id: UUID, *, reason: str) -> DisputeCase:
+        """Bring an abandoned pending run to the ``FAILED`` tombstone state.
+
+        Used by retry exhaustion and by the recovery sweep for a TTL-expired run. The
+        case returns to ``OPEN`` so it can be investigated again; a failure does not
+        leave the case stuck in ``INVESTIGATING`` with nothing running. ``version``
+        advances because the case's state genuinely changed.
+        """
+        index = next(
+            (i for i, run in enumerate(self.investigations) if run.id == investigation_id),
+            None,
+        )
+        if index is None:
+            raise CaseTransitionError(f"investigation {investigation_id} is not part of this case")
+        existing = self.investigations[index]
+        if not existing.is_pending:
+            raise CaseTransitionError(
+                f"investigation {investigation_id} is {existing.status.value}, not pending"
+            )
+        if not reason.strip():
+            raise ValueError("failing an investigation requires a reason")
+        failed = replace(
+            existing,
+            status=InvestigationRunStatus.FAILED,
+            stage_status={
+                **dict(existing.stage_status),
+                "overall": InvestigationRunStatus.FAILED.value,
+                "failure_reason": reason.strip(),
+            },
+        )
+        investigations = (
+            *self.investigations[:index],
+            failed,
+            *self.investigations[index + 1 :],
+        )
+        status = (
+            CaseStatus.OPEN if self.status is CaseStatus.INVESTIGATING else self.status
+        )
+        return replace(
+            self,
+            investigations=investigations,
+            status=status,
+            version=self.version + 1,
+        )
+
     def reopened(self, reason: str, at: datetime) -> DisputeCase:
         """Reopen a closed case. Reason is mandatory (§3.4)."""
         if self.status not in (CaseStatus.RESOLVED, CaseStatus.REJECTED):
@@ -697,6 +1017,45 @@ class DisputeCase:
         if not self._target_exists(target, action):
             raise CaseTransitionError(f"{action.target_type.value} {action.target_id} not found")
         return replace(self, reviews=(*self.reviews, action), version=self.version + 1)
+
+    def decided(self, decision: DisputeDecision) -> DisputeCase:
+        """Close the case with a reviewer's verdict.
+
+        The safety property this guard provides is the point of the endpoint: a
+        case may only be decided by the run that is actually under review, over
+        evidence that is still attached, and only after that run has been reviewed
+        at least once -- a verdict on a run nobody has looked at is not a review,
+        it is an order.
+
+        ``decision.investigation_id`` must be the *current* run, not a superseded
+        one: deciding a case against version 1 while version 2 sits on it would
+        record a verdict the reviewer could not have compared. New evidence since
+        the run (``is_stale``) therefore also refuses the decision, exactly as it
+        refuses a review.
+        """
+        if self.status is not CaseStatus.AWAITING_REVIEW:
+            raise CaseTransitionError(
+                f"case {self.external_id} is {self.status.value}; "
+                "a case is decided only while it awaits review"
+            )
+        if decision.investigation_id != self.current_investigation_id:
+            raise CaseTransitionError(
+                "a decision must target the investigation that is currently under review"
+            )
+        if self.is_stale:
+            raise CaseTransitionError(
+                "investigation is stale; re-investigate before deciding the case"
+            )
+        if not any(review.investigation_id == decision.investigation_id for review in self.reviews):
+            raise CaseTransitionError(
+                "a case cannot be decided before the run under review has been reviewed"
+            )
+        return replace(
+            self,
+            decisions=(*self.decisions, decision),
+            status=CaseStatus(decision.decision.value),
+            version=self.version + 1,
+        )
 
     @staticmethod
     def _target_exists(investigation: InvestigationRecord, action: ReviewAction) -> bool:

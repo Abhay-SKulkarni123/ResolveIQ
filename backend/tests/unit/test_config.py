@@ -7,6 +7,8 @@ loaded, so they are worth pinning explicitly.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.config import DOTENV_PATH, REPO_ROOT, TEST_DATABASE_NAME, Settings
@@ -110,3 +112,55 @@ def test_database_url_resolves_identically_from_any_working_directory(
     monkeypatch.chdir(tmp_path)
     from_elsewhere = Settings().database_url
     assert from_elsewhere == from_repo_root
+
+
+# ---------------------------------------------------------------------------
+# .env.example stays the single source of truth
+# ---------------------------------------------------------------------------
+# The example file is the one documented place every variable lives. Nothing in
+# it may be dead (documented but never read) and no live setting may be missing
+# from it. This pair of tests keeps Settings and .env.example from drifting.
+
+
+def _documented_env_keys() -> set[str]:
+    """Keys the example file actually sets, ignoring paragraphs and comments.
+
+    Only lines that are neither blank nor commented out are environments. In
+    particular the commented-out MySQL replacement block contributes nothing.
+    """
+    keys: set[str] = set()
+    for raw in (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^([A-Z][A-Z0-9_]*)\s*=", stripped)
+        if match:
+            keys.add(match.group(1))
+    return keys
+
+
+#: Variables .env.example documents that are read by Compose, the provisioning
+#: SQL or the migration runner rather than by app.settings.Settings.
+NON_SETTING_ENV_KEYS = {
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_DB",
+    "POSTGRES_HOST",
+    "POSTGRES_PORT",
+    "ALEMBIC_DATABASE_URL",
+}
+
+
+def test_every_documented_env_key_is_a_setting_or_an_allowed_extra() -> None:
+    """No dead entries: MONEY_SCALE and friends must not sneak back in."""
+    documented = _documented_env_keys()
+    known = {name.upper() for name in Settings.model_fields} | NON_SETTING_ENV_KEYS
+    unknown = documented - known
+    assert not unknown, f"documented in .env.example but never read: {sorted(unknown)}"
+
+
+def test_every_setting_is_documented_in_the_example_file() -> None:
+    """No hidden knobs: adding a Settings field must come with a .env.example row."""
+    documented = _documented_env_keys()
+    missing = {name.upper() for name in Settings.model_fields} - documented
+    assert not missing, f"live settings missing from .env.example: {sorted(missing)}"

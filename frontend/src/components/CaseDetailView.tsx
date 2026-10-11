@@ -19,7 +19,11 @@ import { useCallback, useEffect, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
 import type {
+  AuditEventResponse,
+  AuditHistory,
   CaseDetail,
+  DecisionKind,
+  DecisionResponse,
   FindingResponse,
   HypothesisResponse,
   InvestigationResponse,
@@ -47,19 +51,31 @@ const REVIEW_ACTIONS: { value: ReviewAction; label: string }[] = [
 
 export function CaseDetailView({
   caseId,
+  actorRole,
   onChanged,
 }: {
   caseId: string
+  actorRole: string
   onChanged?: () => void
 }) {
   const [detail, setDetail] = useState<CaseDetail | null>(null)
+  const [audit, setAudit] = useState<AuditHistory | null>(null)
   const [error, setError] = useState<ApiError | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
-      setDetail(await api.getCase(caseId))
+      // The trail is a separate read from the detail, so it is fetched alongside it
+      // rather than embedded in it: a case with a long history does not weigh down
+      // the response every viewer loads, and a failure to read the audit does not
+      // stop the case itself from rendering.
+      const [nextDetail, nextAudit] = await Promise.all([
+        api.getCase(caseId),
+        api.getAudit(caseId, { limit: 100 }),
+      ])
+      setDetail(nextDetail)
+      setAudit(nextAudit)
       setError(null)
     } catch (caught) {
       setError(caught instanceof ApiError ? caught : new ApiError(0, 'UNKNOWN', String(caught), null, null))
@@ -164,6 +180,18 @@ export function CaseDetailView({
             run(() => api.reopen(detail.id, reason), 'Case reopened. It needs a new run.')
           }
         />
+        {detail.status === 'AWAITING_REVIEW' && actorRole === 'reviewer' && (
+          <DecidePanel
+            busy={busy}
+            reviewed={Boolean(latest && detail.reviews.some((review) => review.investigation_id === latest.id))}
+            onDecide={(decision, rationale) =>
+              run(
+                () => api.decide(detail.id, decision, rationale),
+                decision === 'RESOLVED' ? 'Case resolved.' : 'Case rejected.',
+              )
+            }
+          />
+        )}
         {/* No approve, no adjust, no execute. Those arrive with the Phase 8 guards. */}
       </section>
 
@@ -186,6 +214,8 @@ export function CaseDetailView({
 
       <EvidencePanel detail={detail} />
       <HistoryPanel runs={detail.investigations} currentId={latest?.id ?? null} />
+      {detail.decisions.length > 0 && <DecisionHistory decisions={detail.decisions} />}
+      {audit && audit.items.length > 0 && <AuditPanel history={audit} />}
     </div>
   )
 }
@@ -246,6 +276,59 @@ function ReopenButton({
         label="Reopen"
       />
     </span>
+  )
+}
+
+function DecidePanel({
+  busy,
+  reviewed,
+  onDecide,
+}: {
+  busy: boolean
+  reviewed: boolean
+  onDecide: (decision: DecisionKind, rationale: string) => void
+}) {
+  const [rationale, setRationale] = useState('')
+  const invalid = busy || rationale.trim() === ''
+  return (
+    <div className="rounded border border-line bg-surface px-3 py-2">
+      <p className="text-xs font-medium">Close the case</p>
+      {!reviewed && (
+        <p className="text-xs text-warn-text">
+          Nothing has been reviewed on the newest run yet. The backend will refuse a
+          verdict until it has.
+        </p>
+      )}
+      <span className="flex flex-wrap items-center gap-2">
+        <label className="sr-only" htmlFor="decision-rationale">
+          Decision rationale
+        </label>
+        <input
+          id="decision-rationale"
+          value={rationale}
+          onChange={(event) => setRationale(event.target.value)}
+          placeholder="Why this verdict?"
+          disabled={busy || !reviewed}
+          className="min-w-56 flex-1 rounded border border-line px-2 py-1.5 text-sm"
+        />
+        <button
+          type="button"
+          disabled={invalid || !reviewed}
+          onClick={() => onDecide('RESOLVED', rationale)}
+          className="rounded border border-line bg-surface px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Resolve
+        </button>
+        <button
+          type="button"
+          disabled={invalid || !reviewed}
+          onClick={() => onDecide('REJECTED', rationale)}
+          className="rounded border border-line bg-surface px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Reject
+        </button>
+      </span>
+    </div>
   )
 }
 
@@ -691,6 +774,110 @@ function HistoryPanel({
                 {run.calculation.is_provisional && ' (provisional)'}
               </p>
             )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
+const AUDIT_LABELS: Record<AuditEventResponse['event_type'], string> = {
+  CASE_CREATED: 'Case opened',
+  EVIDENCE_ATTACHED: 'Evidence attached',
+  INVESTIGATION_COMPLETED: 'Investigation completed',
+  REVIEW_RECORDED: 'Review recorded',
+  DECISION_RECORDED: 'Decision recorded',
+  CASE_REOPENED: 'Case reopened',
+}
+
+/**
+ * A short, human sentence for the one payload field worth surfacing per event kind.
+ *
+ * The payload is a bag the server passes through untouched, so this reads the few keys
+ * it knows and shows nothing for the rest, rather than stringifying the whole object.
+ * A reader needs "why was it reopened", not a JSON dump.
+ */
+function auditDetail(event: AuditEventResponse): string | null {
+  const payload = event.payload
+  const text = (key: string): string | null =>
+    typeof payload[key] === 'string' ? (payload[key] as string) : null
+  switch (event.event_type) {
+    case 'CASE_REOPENED':
+      return text('reason')
+    case 'DECISION_RECORDED':
+      return text('decision')
+    case 'REVIEW_RECORDED':
+      return text('action')
+    case 'EVIDENCE_ATTACHED':
+      return typeof payload['evidence_count'] === 'number'
+        ? `${payload['evidence_count']} items`
+        : null
+    default:
+      return null
+  }
+}
+
+/**
+ * The case's audit trail, oldest-first.
+ *
+ * This is the one place the whole sequence is legible in order: every event, who did
+ * it, and the version it left the case at. The panel is read-only by construction --
+ * there is no verb here because the backend has none, and an editable audit trail is
+ * worth nothing.
+ */
+function AuditPanel({ history }: { history: AuditHistory }) {
+  return (
+    <section>
+      <h2 className="text-sm font-semibold">Audit trail ({history.total})</h2>
+      <p className="text-xs text-ink-muted">
+        Everything that happened to this case, oldest first. Append-only: nothing here can
+        be edited or removed.
+      </p>
+      <ol className="mt-2 space-y-1">
+        {history.items.map((event) => (
+          <li
+            key={event.id}
+            className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 rounded border border-line bg-surface px-3 py-1.5 text-xs"
+          >
+            <span className="font-medium">{AUDIT_LABELS[event.event_type]}</span>
+            {auditDetail(event) && <span className="text-ink-muted">{auditDetail(event)}</span>}
+            <span className="text-ink-muted">
+              {event.actor_id
+                ? event.actor_role
+                  ? `by ${event.actor_id} (${event.actor_role})`
+                  : `by ${event.actor_id}`
+                : 'by system'}
+            </span>
+            {event.entity_version !== null && (
+              <span className="text-ink-faint">version {event.entity_version}</span>
+            )}
+            <span className="text-ink-faint">{event.occurred_at}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  )
+}
+
+function DecisionHistory({ decisions }: { decisions: DecisionResponse[] }) {
+  return (
+    <section>
+      <h2 className="text-sm font-semibold">Closing decisions</h2>
+      <p className="text-xs text-ink-muted">
+        Every verdict that closed the case. A reopened case keeps its history.
+      </p>
+      <ul className="mt-2 space-y-2">
+        {decisions.map((decision) => (
+          <li key={decision.id} className="rounded border border-line bg-surface px-3 py-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-medium">{decision.decision.toLowerCase()}</span>
+              <span className="text-ink-muted">
+                by {decision.actor_id} ({decision.actor_role})
+              </span>
+              <span className="text-ink-faint">{decision.created_at}</span>
+            </div>
+            {decision.rationale && <p className="mt-1 text-ink-muted">{decision.rationale}</p>}
+            <Fingerprint value={decision.evidence_fingerprint_seen} label="decided against" />
           </li>
         ))}
       </ul>

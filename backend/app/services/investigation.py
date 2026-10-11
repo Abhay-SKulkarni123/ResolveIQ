@@ -33,13 +33,17 @@ interpretation that never validated.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+import logging
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Final
 
 from app.domain.billing import Adjustment, Payment, PriceTerm, RecordedInvoice, UsageEvent
 from app.domain.evidence import EvidenceBundle
 from app.domain.hypotheses import HypothesisCode
-from app.domain.investigation import InvestigationStatus
+from app.domain.investigation import InvestigationStage, InvestigationStatus
+from app.logging_config import error_category, log_event
 from app.ports.interpretation import InterpretationResponse
 from app.ports.llm import (
     InterpretationRequest,
@@ -70,6 +74,8 @@ __all__ = [
     "Provenance",
     "investigate",
 ]
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,15 @@ class InvestigationResult:
     #: Provenance of the deterministic figures, so a reviewer can tell which engine
     #: version produced the numbers in the response.
     engine_version: str = "1.0.0"
+    #: Per-stage status of this run, so a failure says *where* it stopped and a
+    #: recovery can resume from the first stage that did not complete (ADR-008). The
+    #: shape is documented on ``InvestigationRecord``.
+    stage_status: Mapping[str, Any] = field(default_factory=dict)
+    #: Whether a rerun of this investigation could plausibly succeed. True only for a
+    #: transient provider failure (a timeout or a provider error), because a
+    #: misconfiguration or an unparseable answer will fail identically however many
+    #: times it is retried.
+    retryable: bool = False
 
     def __post_init__(self) -> None:
         """Refuse to report a complete run that is not one (FR-012).
@@ -214,6 +229,50 @@ def _classify_failure(exc: Exception) -> InvestigationStatus:
     )
 
 
+#: The stages the workflow records, in the order they run. ``PENDING`` is a marker, not
+#: a stage the workflow enters, so it is excluded; the terminal statuses are the overall
+#: outcome rather than a stage.
+_WORKFLOW_STAGES: Final[tuple[InvestigationStage, ...]] = (
+    InvestigationStage.COLLECTING_EVIDENCE,
+    InvestigationStage.INTERPRETING,
+    InvestigationStage.COMPUTING_IMPACT,
+    InvestigationStage.PROPOSING_RESOLUTIONS,
+)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether rerunning the workflow could plausibly do better.
+
+    A misconfiguration (:class:`LlmNotConfiguredError`) and an answer that did not parse
+    (:class:`LlmResponseFormatError`) are permanent: the same inputs produce the same
+    failure, so retrying only burns the budget. A timeout or a provider error is
+    transient and worth another attempt. Order matters here for the same reason it does
+    in :func:`_classify_failure`: the format error is a subclass of the provider error.
+    """
+    if isinstance(exc, (LlmNotConfiguredError, LlmResponseFormatError)):
+        return False
+    return isinstance(exc, (LlmTimeoutError, LlmProviderError))
+
+
+def _stages_completed() -> dict[str, str]:
+    return {stage.value: "COMPLETE" for stage in _WORKFLOW_STAGES}
+
+
+def _stages_after_failure(status: InvestigationStatus) -> dict[str, str]:
+    """Where the run stopped, for a recovery to resume from.
+
+    Evidence collection and the deterministic recalculation both ran before the
+    interpretation was attempted, so they are complete; interpretation is the stage that
+    failed; proposing resolutions never ran.
+    """
+    return {
+        InvestigationStage.COLLECTING_EVIDENCE.value: "COMPLETE",
+        InvestigationStage.INTERPRETING.value: status.value,
+        InvestigationStage.COMPUTING_IMPACT.value: "COMPLETE",
+        InvestigationStage.PROPOSING_RESOLUTIONS.value: "PENDING",
+    }
+
+
 @dataclass(frozen=True)
 class InvestigationInputs:
     """Everything one investigation is run against.
@@ -309,6 +368,14 @@ def investigate(
         dispute_text=inputs.dispute_text,
         dispute_text_max_chars=inputs.dispute_text_max_chars,
     )
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "investigation.evidence.collected",
+        dispute_id=inputs.dispute_external_id,
+        evidence_fingerprint=evidence.fingerprint,
+        allowed_evidence_keys=len(evidence.allowed_keys),
+    )
 
     # 2. Calculate. No model involved, so these figures stand regardless of what follows.
     recalculation = recalculate_invoice(
@@ -347,12 +414,35 @@ def investigate(
     )
 
     try:
+        started = time.perf_counter()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "ai.provider.invoked",
+            dispute_id=inputs.dispute_external_id,
+            provider=provenance.provider_name,
+            model=provenance.model,
+            prompt_version=inputs.prompt_version,
+        )
         response = provider.structured_infer(request)
         validated = validator.validate(response, evidence.allowed_keys)
     except (LlmProviderError, InvalidCitationsError) as exc:
+        status = _classify_failure(exc)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "ai.provider.failed",
+            dispute_id=inputs.dispute_external_id,
+            provider=provenance.provider_name,
+            model=provenance.model,
+            prompt_version=inputs.prompt_version,
+            duration_ms=_elapsed_ms(started),
+            outcome=status.value,
+            error_category=error_category(exc),
+        )
         return InvestigationResult(
             dispute_external_id=inputs.dispute_external_id,
-            status=_classify_failure(exc),
+            status=status,
             evidence=evidence,
             recalculation=recalculation,
             balance=balance,
@@ -361,7 +451,26 @@ def investigate(
             interpretation=None,
             impacts=(),
             degradations=(*degradations, f"the interpretation stage did not complete: {exc}"),
+            stage_status={
+                "overall": status.value,
+                "stages": _stages_after_failure(status),
+            },
+            retryable=_is_retryable(exc),
         )
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "ai.provider.succeeded",
+        dispute_id=inputs.dispute_external_id,
+        provider=provenance.provider_name,
+        model=provenance.model,
+        prompt_version=inputs.prompt_version,
+        duration_ms=_elapsed_ms(started),
+        outcome="ok",
+        finding_count=len(validated.response.findings),
+        hypothesis_count=len(validated.response.hypotheses),
+    )
 
     impacts = tuple(
         assess_impact(hypothesis.hypothesis_code, view, hypothesis.metric_key)
@@ -381,4 +490,13 @@ def investigate(
         interpretation=validated,
         impacts=impacts,
         degradations=tuple(degradations),
+        stage_status={
+            "overall": status.value,
+            "stages": _stages_completed(),
+        },
+        retryable=False,
     )
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 3)

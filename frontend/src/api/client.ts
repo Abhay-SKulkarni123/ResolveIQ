@@ -10,10 +10,13 @@
 
 import type {
   ApiErrorBody,
+  AuditHistory,
   Capabilities,
   CaseDetail,
   CaseList,
   CaseStatus,
+  DecisionKind,
+  DecisionResponse,
   ReviewAction,
   ReviewResponse,
   ReviewTargetType,
@@ -28,6 +31,7 @@ export const ErrorCode = {
   InvalidTransition: 'INVALID_TRANSITION',
   NotInvestigable: 'NOT_INVESTIGABLE',
   InvalidIdentity: 'INVALID_IDENTITY',
+  ReviewerRequired: 'REVIEWER_REQUIRED',
   DatabaseUnavailable: 'DATABASE_UNAVAILABLE',
   ValidationFailed: 'VALIDATION_FAILED',
   NotFound: 'NOT_FOUND',
@@ -143,6 +147,18 @@ export const api = {
 
   getCase: (id: string): Promise<CaseDetail> => request(`/disputes/${id}`),
 
+  /**
+   * A case's audit trail, oldest-first. The server pages it, so a long-lived case does
+   * not arrive as one unbounded list.
+   */
+  getAudit: (id: string, params: { limit?: number; offset?: number } = {}): Promise<AuditHistory> => {
+    const query = new URLSearchParams()
+    if (params.limit !== undefined) query.set('limit', String(params.limit))
+    if (params.offset !== undefined) query.set('offset', String(params.offset))
+    const suffix = query.toString()
+    return request(`/disputes/${id}/audit${suffix ? `?${suffix}` : ''}`)
+  },
+
   investigate: (id: string): Promise<CaseDetail['investigations'][number]> =>
     request(`/disputes/${id}/investigations`, { method: 'POST', body: '{}' }),
 
@@ -188,6 +204,16 @@ export const api = {
 
   reopen: (id: string, reason: string): Promise<CaseDetail> =>
     request(`/disputes/${id}/reopen`, { method: 'POST', body: JSON.stringify({ reason }) }),
+
+  /**
+   * Close the case with a reviewer's verdict. The backend refuses a caller whose
+   * `X-Actor-Role` is not `reviewer` with `REVIEWER_REQUIRED` (403).
+   */
+  decide: (id: string, decision: DecisionKind, rationale: string): Promise<DecisionResponse> =>
+    request(`/disputes/${id}/decision`, {
+      method: 'POST',
+      body: JSON.stringify({ decision, rationale }),
+    }),
 
   /**
    * Deliberately absent: approve, adjustment, execute.

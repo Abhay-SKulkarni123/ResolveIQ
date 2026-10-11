@@ -15,6 +15,10 @@ Three properties are the point of the whole layer, and each has tests below:
 * **The API offers no way to move money.** There is no approve, no adjustment, no
   execute route, and the review verb list has no ``APPROVE``. A test asserts the 404
   rather than trusting the route list to stay short.
+* **The decision endpoint closes the lifecycle and nothing else.** ``RESOLVED`` /
+  ``REJECTED`` is the verdict that ends a case's review, gated to the reviewer role
+  and carrying no amount. It is a separate record from the money-movement guards of
+  the resolution phase.
 
 Also asserted: the memory store is *reported* as non-durable. A reviewer must not have
 to read the settings file to know their data is ephemeral.
@@ -609,6 +613,212 @@ def test_an_investigation_carries_the_evidence_it_read(client: TestClient) -> No
 
     assert run["evidence_fingerprint"] == created["evidence_fingerprint"]
     assert run["evidence"]
+
+
+# ---------------------------------------------------------------------------
+# Decision
+# ---------------------------------------------------------------------------
+
+
+def _reviewed_case(client: TestClient) -> dict[str, Any]:
+    """An awaiting-review case whose current run has been annotated."""
+    created = open_case(client)
+    run = client.post(f"/api/v1/disputes/{created['id']}/investigations", json={}).json()
+    response = client.post(
+        f"/api/v1/disputes/{created['id']}/review",
+        json={
+            "investigation_id": run["id"],
+            "target_type": "FINDING",
+            "target_id": run["findings"][0]["id"],
+            "action": "ACCEPT",
+            "rationale": "matches the dashboard export",
+        },
+    )
+    assert response.status_code == 201, response.text
+    return created
+
+
+def test_a_reviewer_can_decide_a_case(client: TestClient) -> None:
+    created = _reviewed_case(client)
+
+    response = client.post(
+        f"/api/v1/disputes/{created['id']}/decision",
+        json={"decision": "RESOLVED", "rationale": "recalculated total was chargeable"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["decision"] == "RESOLVED"
+    assert body["actor_id"] == "rev-1"
+    assert body["rationale"] == "recalculated total was chargeable"
+    assert body["evidence_fingerprint_seen"] == created["evidence_fingerprint"]
+    detail = client.get(f"/api/v1/disputes/{created['id']}").json()
+    assert detail["status"] == "RESOLVED"
+    assert len(detail["decisions"]) == 1
+
+
+def test_an_analyst_cannot_decide_a_case(client: TestClient) -> None:
+    """The verdict changes the lifecycle permanently; only the reviewer role may do it."""
+    created = _reviewed_case(client)
+
+    response = client.post(
+        f"/api/v1/disputes/{created['id']}/decision",
+        json={"decision": "RESOLVED", "rationale": "I ran the numbers"},
+        headers={"X-Actor-Id": "ana-1", "X-Actor-Role": "analyst"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "REVIEWER_REQUIRED"
+    assert client.get(f"/api/v1/disputes/{created['id']}").json()["status"] == "AWAITING_REVIEW"
+
+
+def test_deciding_before_any_review_is_a_409(client: TestClient) -> None:
+    """A verdict on a run nobody has looked at is not a review."""
+    created = open_case(client)
+    client.post(f"/api/v1/disputes/{created['id']}/investigations", json={})
+
+    response = client.post(
+        f"/api/v1/disputes/{created['id']}/decision",
+        json={"decision": "RESOLVED", "rationale": "case looks right to me"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "INVALID_TRANSITION"
+
+
+def test_deciding_a_case_that_is_not_awaiting_review_is_a_409(client: TestClient) -> None:
+    created = open_case(client)
+
+    response = client.post(
+        f"/api/v1/disputes/{created['id']}/decision",
+        json={"decision": "RESOLVED", "rationale": "fine"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "INVALID_TRANSITION"
+
+
+def test_a_decision_without_a_rationale_is_rejected(client: TestClient) -> None:
+    created = _reviewed_case(client)
+
+    response = client.post(
+        f"/api/v1/disputes/{created['id']}/decision",
+        json={"decision": "RESOLVED", "rationale": "   "},
+    )
+
+    assert response.status_code == 422
+
+
+def test_the_decision_schema_offers_no_amount(client: TestClient) -> None:
+    """A verdict closes the case; it is not the executable adjustment."""
+    created = _reviewed_case(client)
+
+    response = client.post(
+        f"/api/v1/disputes/{created['id']}/decision",
+        json={
+            "decision": "RESOLVED",
+            "rationale": "ok",
+            "amount": {"amount": "1.00", "currency": "USD"},
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_capabilities_flags_the_decision_feature(client: TestClient) -> None:
+    """The verdict is present, and approving/adjusting is still explicitly absent."""
+    features = client.get("/api/v1/capabilities").json()["features"]
+
+    assert features["case_decision"] is True
+    assert features["approval"] is False
+    assert features["adjustments"] is False
+
+
+# ---------------------------------------------------------------------------
+# Idempotency-Key header
+# ---------------------------------------------------------------------------
+
+
+def test_a_retried_open_with_the_same_key_returns_the_first_case(client: TestClient) -> None:
+    """The retry is a replay, not a second case and not a 409."""
+    headers = {"Idempotency-Key": "open-abc"}
+    first = client.post("/api/v1/disputes", json=open_payload(), headers=headers)
+
+    replayed = client.post("/api/v1/disputes", json=open_payload(), headers=headers)
+
+    assert first.status_code == 201
+    assert replayed.status_code == 201
+    assert replayed.json()["id"] == first.json()["id"]
+    assert len(client.get("/api/v1/disputes").json()["items"]) == 1
+
+
+def test_a_blank_idempotency_key_is_treated_as_absent(client: TestClient) -> None:
+    """A whitespace header is not a key, so the external-id guard still applies."""
+    client.post("/api/v1/disputes", json=open_payload(), headers={"Idempotency-Key": "   "})
+
+    response = client.post(
+        "/api/v1/disputes", json=open_payload(), headers={"Idempotency-Key": "   "}
+    )
+
+    assert response.status_code == 409
+
+
+def test_a_retried_investigation_with_the_same_key_returns_the_first_run(
+    client: TestClient,
+) -> None:
+    created = open_case(client)
+    url = f"/api/v1/disputes/{created['id']}/investigations"
+    headers = {"Idempotency-Key": "run-abc"}
+
+    first = client.post(url, json={}, headers=headers)
+    replayed = client.post(url, json={}, headers=headers)
+
+    assert first.status_code == 201
+    assert replayed.status_code == 201
+    assert replayed.json()["id"] == first.json()["id"]
+    detail = client.get(f"/api/v1/disputes/{created['id']}").json()
+    assert len(detail["investigations"]) == 1
+
+
+def test_a_retried_review_with_the_same_key_is_stored_once(client: TestClient) -> None:
+    created = open_case(client)
+    run = client.post(f"/api/v1/disputes/{created['id']}/investigations", json={}).json()
+    url = f"/api/v1/disputes/{created['id']}/review"
+    payload = {
+        "investigation_id": run["id"],
+        "target_type": "FINDING",
+        "target_id": run["findings"][0]["id"],
+        "action": "ACCEPT",
+        "rationale": "matches the dashboard export",
+    }
+    headers = {"Idempotency-Key": "review-abc"}
+
+    first = client.post(url, json=payload, headers=headers)
+    replayed = client.post(url, json=payload, headers=headers)
+
+    assert first.status_code == 201
+    assert replayed.status_code == 201
+    assert replayed.json()["id"] == first.json()["id"]
+    detail = client.get(f"/api/v1/disputes/{created['id']}").json()
+    assert len(detail["reviews"]) == 1
+
+
+def test_a_retried_decision_with_the_same_key_returns_the_verdict_once(
+    client: TestClient,
+) -> None:
+    created = _reviewed_case(client)
+    url = f"/api/v1/disputes/{created['id']}/decision"
+    payload = {"decision": "RESOLVED", "rationale": "recalculated total was chargeable"}
+    headers = {"Idempotency-Key": "decide-abc"}
+
+    first = client.post(url, json=payload, headers=headers)
+    replayed = client.post(url, json=payload, headers=headers)
+
+    assert first.status_code == 201
+    assert replayed.status_code == 201
+    assert replayed.json()["id"] == first.json()["id"]
+    detail = client.get(f"/api/v1/disputes/{created['id']}").json()
+    assert len(detail["decisions"]) == 1
 
 
 # ---------------------------------------------------------------------------

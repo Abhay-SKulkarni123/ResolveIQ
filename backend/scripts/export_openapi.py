@@ -25,9 +25,12 @@ from app.main import app
 #: claims to mirror it. Kept here, next to the export, so adding a mirrored schema is a
 #: deliberate act rather than a side effect of dumping everything.
 MIRRORED: dict[str, str] = {
+    "AuditEventResponse": "AuditEventResponse",
+    "AuditHistoryResponse": "AuditHistory",
     "CalculationResponse": "CalculationResponse",
     "CaseListResponse": "CaseList",
     "CaseSummaryResponse": "CaseSummary",
+    "DecisionResponse": "DecisionResponse",
     "DisputeDetailResponse": "CaseDetail",
     "EvidenceResponse": "EvidenceResponse",
     "FindingResponse": "FindingResponse",

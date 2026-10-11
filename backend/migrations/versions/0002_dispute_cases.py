@@ -8,12 +8,12 @@ Implements the dispute-side entity table in docs/SYSTEM_DESIGN.md §3.3 for
 everything Phase 4 needs. The source-system tables of §3.2 are already present
 from ``0001_initial_schema``.
 
-Deliberately absent: ``adjustments``, ``review_decisions`` and ``audit_events``.
-Approval and money movement are a later phase, and ``review_decisions`` would need
-the idempotency and separation-of-duties rules of §9.3 that phase has not designed
-yet. What Phase 4 does need -- a reviewer annotating a finding, amending its
-wording, rejecting it or asking for more information -- is ``finding_reviews``,
-which records no approval and moves no money.
+Deliberately absent here: ``adjustments`` and ``audit_events``.
+Approval and money movement are a later phase (the idempotency and separation-of-duties
+rules of §9.3 it has not designed yet), and a closing verdict -- ``dispute_decisions``,
+no money -- arrives in ``0003_dispute_decisions``. What Phase 4 does need -- a reviewer
+annotating a finding, amending its wording, rejecting it or asking for more information --
+is ``finding_reviews``, which records no approval and moves no money.
 
 Ordering
 --------
@@ -208,7 +208,7 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint("version >= 1", name="version_is_positive"),
         sa.CheckConstraint(
-            "status IN ('PENDING','COMPLETE','DEGRADED','PARTIAL_FAILED')",
+            "status IN ('PENDING','COMPLETE','DEGRADED','PARTIAL_FAILED','FAILED')",
             name="status_is_known",
         ),
         sa.CheckConstraint(

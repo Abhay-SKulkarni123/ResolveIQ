@@ -120,6 +120,10 @@ class Settings(BaseSettings):
 
     # -- investigation -------------------------------------------------------
     investigation_ttl_hours: int = 24
+    # How many times a transient provider failure is retried before the run is
+    # recorded with its deterministic result. Must be at least one: a budget of zero
+    # would mean the workflow never runs, which is never what a configuration means.
+    investigation_max_attempts: int = Field(default=3, ge=1)
     dispute_description_max_chars: int = 10_000
 
     # -- demo identity -------------------------------------------------------

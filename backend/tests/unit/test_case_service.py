@@ -1,4 +1,4 @@
-"""The case service: opening, investigating, attaching, reviewing, reopening.
+"""The case service: opening, investigating, attaching, reviewing, deciding, reopening.
 
 The aggregate tests cover the rules; these cover the wiring. What matters here is not
 that ``open_case`` returns a case but that it cannot return one *without* its evidence,
@@ -22,8 +22,9 @@ Two claims are load-bearing and get their own tests:
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import date, datetime, timezone
+import logging
+from dataclasses import fields, replace
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -31,6 +32,7 @@ import pytest
 
 from app.adapters.llm.mock import MockLlmProvider
 from app.adapters.persistence.memory_case_repository import InMemoryCaseRepository
+from app.domain.audit import AuditEventType
 from app.domain.billing import (
     Adjustment,
     InvoiceLine,
@@ -45,8 +47,11 @@ from app.domain.billing import (
 from app.domain.cases import (
     CaseStatus,
     CaseTransitionError,
+    DecisionKind,
     DisputeCase,
     EvidenceItem,
+    InvestigationRecord,
+    InvestigationRunStatus,
     ReviewActionKind,
     ReviewTargetType,
 )
@@ -55,6 +60,7 @@ from app.domain.evidence import EvidenceType
 from app.domain.json_frozen import thaw_json
 from app.domain.money import Money
 from app.ports.cases import CaseConflictError, CaseNotFoundError
+from app.ports.llm import LlmTimeoutError
 from app.services.cases import (
     CaseNotInvestigableError,
     CaseService,
@@ -137,9 +143,10 @@ def service(repository: InMemoryCaseRepository) -> CaseService:
 def close(repository: InMemoryCaseRepository, case: DisputeCase) -> DisputeCase:
     """Put a case into a closed state.
 
-    Phase 4 has no resolution endpoint, so a test that needs a closed case has to
-    drive the transition itself. Written once here so no test reaches into the
-    repository for a reason it does not explain.
+    Used by the reopen tests, which only need a closed *starting point*. The real
+    route into that state is ``CaseService.decide`` (after a review); forcing the
+    status here keeps reopen tests from having to rehearse the whole review chain to
+    set up an unrelated precondition.
     """
     closed = replace(case, status=CaseStatus.RESOLVED)
     repository.save(closed, expected_version=case.version)
@@ -742,6 +749,343 @@ def test_a_review_of_a_finding_on_another_case_is_refused(service: CaseService) 
 
 
 # ---------------------------------------------------------------------------
+# Decide
+# ---------------------------------------------------------------------------
+
+
+def test_deciding_a_reviewed_awaiting_case_closes_it(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """A verdict the case was open for actually lands and persists."""
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="matches the dashboard export",
+    )
+
+    decided = service.decide(
+        case.id,
+        decision=DecisionKind.RESOLVED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="the recalculated total matches what was chargeable",
+    )
+
+    assert decided.status is CaseStatus.RESOLVED
+    assert decided.version == service.get(case.id).version
+    assert len(decided.decisions) == 1
+    stored = service.get(case.id)
+    assert stored.status is CaseStatus.RESOLVED
+    assert stored.decisions[0].decision is DecisionKind.RESOLVED
+    assert stored.decisions[0].evidence_fingerprint_seen == case.evidence_fingerprint
+
+
+def test_deciding_a_rejected_verdict_closes_as_rejected(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """Both closings are reachable and stored."""
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.REJECT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="findings do not hold",
+    )
+
+    decided = service.decide(
+        case.id,
+        decision=DecisionKind.REJECTED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="case does not survive review",
+    )
+
+    assert decided.status is CaseStatus.REJECTED
+
+
+def test_deciding_a_case_before_any_review_is_refused(service: CaseService) -> None:
+    """A byte of the review chain is worth a pound of the verdict."""
+    case = service.open_case(command())
+    service.investigate(case.id, prompt_version="prompt-v1")
+
+    with pytest.raises(CaseTransitionError, match="reviewed"):
+        service.decide(
+            case.id,
+            decision=DecisionKind.RESOLVED,
+            actor_id="rev-1",
+            actor_role="reviewer",
+            rationale="should not land",
+        )
+
+
+def test_deciding_a_case_without_a_rationale_is_refused(service: CaseService) -> None:
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="ok",
+    )
+
+    with pytest.raises(ValueError, match="rationale"):
+        service.decide(
+            case.id,
+            decision=DecisionKind.RESOLVED,
+            actor_id="rev-1",
+            actor_role="reviewer",
+            rationale="  ",
+        )
+
+
+def test_a_decision_is_refused_over_stale_evidence(service: CaseService) -> None:
+    """New evidence reopens the case before the verdict can close it."""
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    target = run.findings[0].id
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=target,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="ok",
+    )
+    service.attach_records(case.id, payments=[payment()])
+
+    with pytest.raises(CaseTransitionError):
+        service.decide(
+            case.id,
+            decision=DecisionKind.RESOLVED,
+            actor_id="rev-1",
+            actor_role="reviewer",
+            rationale="should not land",
+        )
+
+
+def test_a_decision_does_not_move_money(service: CaseService) -> None:
+    """The record has no amount field: the verdict is not an execution."""
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="ok",
+    )
+
+    service.decide(
+        case.id,
+        decision=DecisionKind.RESOLVED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="closing verdict",
+    )
+
+    decided = service.get(case.id).decisions[0]
+    assert {
+        "id",
+        "dispute_id",
+        "investigation_id",
+        "decision",
+        "actor_id",
+        "actor_role",
+        "evidence_fingerprint_seen",
+        "rationale",
+        "created_at",
+        "idempotency_key",
+    } == {f.name for f in fields(decided)}
+    assert "amount" not in {f.name for f in fields(decided)}
+
+
+# ---------------------------------------------------------------------------
+# Idempotency keys: a retried write replays, it does not repeat
+# ---------------------------------------------------------------------------
+
+
+def test_a_retried_open_with_a_seen_key_returns_the_first_case(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """A retry carries the same external id, so the replay is matched on the key alone.
+
+    The key is checked before the external-id guard because a successful open stores
+    that id; consulting the guard first would turn the retry into a spurious conflict
+    instead of returning the case the first delivery produced.
+    """
+    first = service.open_case(command(), idempotency_key="open-1")
+
+    replayed = service.open_case(command(), idempotency_key="open-1")
+
+    assert replayed.id == first.id
+    assert len(repository.list()) == 1
+
+
+def test_a_retried_open_without_a_key_is_still_a_conflict(service: CaseService) -> None:
+    """The key is opt-in: no key means the old duplicate-external-id guard still applies."""
+    service.open_case(command())
+
+    with pytest.raises(CaseConflictError, match="already exists"):
+        service.open_case(command())
+
+
+def test_a_retried_investigation_with_a_seen_key_returns_the_first_run(
+    service: CaseService,
+) -> None:
+    """The replay is matched before the state guard.
+
+    A completed run leaves the case ``AWAITING_REVIEW``, where a *new* run is rightly
+    refused; the retry must be recognised as the same request, not the second one.
+    """
+    case = service.open_case(command())
+
+    first = service.investigate(case.id, prompt_version="prompt-v1", idempotency_key="run-1")
+    replayed = service.investigate(
+        case.id, prompt_version="prompt-v1", idempotency_key="run-1"
+    )
+
+    assert replayed.id == first.id
+    assert len(service.get(case.id).investigations) == 1
+
+
+def test_a_retried_review_with_a_seen_key_is_stored_once(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """Two identical reviews from one submit are the gap the key closes."""
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    review = {
+        "investigation_id": run.id,
+        "target_type": ReviewTargetType.FINDING,
+        "target_id": run.findings[0].id,
+        "action": ReviewActionKind.ACCEPT,
+        "actor_id": "rev-1",
+        "actor_role": "reviewer",
+        "rationale": "ok",
+    }
+
+    first = service.record_review(case.id, idempotency_key="review-1", **review)
+    replayed = service.record_review(case.id, idempotency_key="review-1", **review)
+
+    assert replayed.id == first.id
+    assert len(service.get(case.id).reviews) == 1
+
+
+def test_a_retried_decision_with_a_seen_key_decides_once(service: CaseService) -> None:
+    """The replay is matched before the ``AWAITING_REVIEW`` guard.
+
+    A decided case is no longer awaiting review, so the retry has to be matched on
+    the key or it would be refused as an illegal second decision.
+    """
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="ok",
+    )
+
+    service.decide(
+        case.id,
+        decision=DecisionKind.RESOLVED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="closing verdict",
+        idempotency_key="decide-1",
+    )
+    replayed = service.decide(
+        case.id,
+        decision=DecisionKind.RESOLVED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="closing verdict",
+        idempotency_key="decide-1",
+    )
+
+    assert replayed.status is CaseStatus.RESOLVED
+    assert len(service.get(case.id).decisions) == 1
+
+
+def test_deciding_twice_with_different_keys_is_refused(service: CaseService) -> None:
+    """The double-resolution guard does not depend on the key.
+
+    A second verdict -- whether sent with no key or with a fresh one -- targets a case
+    that is no longer ``AWAITING_REVIEW``, so it is refused and no second decision row
+    is written. The key makes a *retry* replay; it does not license a second verdict.
+    """
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="ok",
+    )
+    service.decide(
+        case.id,
+        decision=DecisionKind.RESOLVED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="first verdict",
+        idempotency_key="decide-1",
+    )
+
+    with pytest.raises(CaseTransitionError):
+        service.decide(
+            case.id,
+            decision=DecisionKind.RESOLVED,
+            actor_id="rev-1",
+            actor_role="reviewer",
+            rationale="second verdict",
+            idempotency_key="decide-2",
+        )
+
+    assert len(service.get(case.id).decisions) == 1
+
+
+def test_find_by_idempotency_key_reads_back_the_opened_case(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """The lookup ``open_case`` replays on reads the key the store actually holds."""
+    case = service.open_case(command(), idempotency_key="open-1")
+
+    found = repository.find_by_idempotency_key("open-1")
+    assert found is not None
+    assert found.id == case.id
+    assert repository.find_by_idempotency_key("never-used") is None
+
+
+# ---------------------------------------------------------------------------
 # Reopen
 # ---------------------------------------------------------------------------
 
@@ -978,3 +1322,544 @@ def test_pagination_cannot_repeat_or_skip_a_case_when_timestamps_tie() -> None:
         seen.extend(case.external_id for case in page)
 
     assert len(seen) == len(set(seen)) == 5
+
+
+# ---------------------------------------------------------------------------
+# The audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_opening_a_case_records_a_created_event(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """The first thing that ever happens to a case is recorded as such."""
+    case = service.open_case(command(), actor_id="op-1", actor_role="operator")
+
+    (event,) = service.list_audit(case.id)
+    assert event.event_type is AuditEventType.CASE_CREATED
+    assert event.dispute_id == case.id
+    assert event.investigation_id is None
+    assert event.actor_id == "op-1"
+    assert event.actor_role == "operator"
+    assert event.entity_version == case.version == 1
+    assert dict(event.payload) == {
+        "external_id": case.external_id,
+        "evidence_fingerprint": case.evidence_fingerprint,
+    }
+
+
+def test_an_open_case_without_an_actor_records_no_actor(
+    service: CaseService,
+) -> None:
+    """An automated open is a real open; the event is still recorded, just actorless."""
+    case = service.open_case(command())
+    (event,) = service.list_audit(case.id)
+    assert event.actor_id is None
+    assert event.actor_role is None
+
+
+def test_the_idempotency_key_becomes_the_correlation_id(
+    service: CaseService,
+) -> None:
+    """The key a retried request carries is exactly what links its event to the request."""
+    case = service.open_case(command(), idempotency_key="idem-1")
+    (event,) = service.list_audit(case.id)
+    assert event.correlation_id == "idem-1"
+
+
+def test_a_replayed_open_records_nothing_new(service: CaseService) -> None:
+    """The trail is what happened, not what was requested."""
+    first = service.open_case(command(), idempotency_key="idem-1")
+    second = service.open_case(command(), idempotency_key="idem-1")
+
+    assert second.id == first.id
+    assert service.count_audit(first.id) == 1
+
+
+def test_an_investigation_records_a_completed_event_with_the_run(
+    service: CaseService,
+) -> None:
+    """The run is named by id, not copied: it stays the source of truth."""
+    case = service.open_case(command(), actor_id="ana-1", actor_role="analyst")
+    run = service.investigate(case.id, prompt_version="prompt-v1", actor_id="op-1")
+
+    events = service.list_audit(case.id)
+    assert [event.event_type for event in events] == [
+        AuditEventType.CASE_CREATED,
+        AuditEventType.INVESTIGATION_COMPLETED,
+    ]
+    completed = events[1]
+    assert completed.investigation_id == run.id
+    assert completed.entity_version == 2  # the case moved forward by one run
+    assert dict(completed.payload)["investigation_version"] == run.version
+    assert dict(completed.payload)["status"] == run.status.value
+
+
+def test_a_stale_evidence_attach_records_an_event(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """New evidence changes the fingerprint, so it is a fact worth recording."""
+    case = service.open_case(command())
+    updated = service.attach_records(case.id, payments=[payment()], actor_id="op-1")
+
+    event = service.list_audit(case.id)[-1]
+    assert event.event_type is AuditEventType.EVIDENCE_ATTACHED
+    assert event.entity_version == updated.version
+    assert event.payload["evidence_count"] == len(updated.evidence.items)
+
+
+def test_a_no_op_attach_records_nothing(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    """Re-sending the same records changed nothing, so there is nothing to record."""
+    case = service.open_case(command())
+    service.attach_records(case.id, payments=[payment()])
+    before = service.count_audit(case.id)
+
+    unchanged = service.attach_records(case.id, payments=[payment()])
+
+    assert unchanged.version == service.get(case.id).version
+    assert service.count_audit(case.id) == before
+
+
+def test_a_review_records_the_action_and_target(
+    service: CaseService,
+) -> None:
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="checked against the export",
+    )
+
+    event = service.list_audit(case.id)[-1]
+    assert event.event_type is AuditEventType.REVIEW_RECORDED
+    assert event.investigation_id == run.id
+    assert event.actor_id == "rev-1"
+    assert event.payload["action"] == "ACCEPT"
+    assert event.payload["target_type"] == "FINDING"
+    assert event.payload["target_id"] == str(run.findings[0].id)
+
+
+def test_a_decision_records_the_verdict(service: CaseService) -> None:
+    case = service.open_case(command())
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="checked",
+    )
+    service.decide(
+        case.id,
+        decision=DecisionKind.RESOLVED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="confirmed",
+    )
+
+    event = service.list_audit(case.id)[-1]
+    assert event.event_type is AuditEventType.DECISION_RECORDED
+    assert event.investigation_id == run.id
+    assert event.actor_role == "reviewer"
+    assert event.payload["decision"] == "RESOLVED"
+
+
+def test_a_reopen_records_the_reason(
+    service: CaseService, repository: InMemoryCaseRepository
+) -> None:
+    case = close(repository, service.open_case(command()))
+    service.reopen(
+        case.id,
+        reason="customer sent a usage export",
+        actor_id="rev-1",
+        actor_role="reviewer",
+    )
+
+    event = service.list_audit(case.id)[-1]
+    assert event.event_type is AuditEventType.CASE_REOPENED
+    assert event.actor_id == "rev-1"
+    assert event.payload["reason"] == "customer sent a usage export"
+
+
+def test_the_trail_reads_oldest_first_from_open_to_close(
+    service: CaseService,
+) -> None:
+    """The whole point: one ordered sequence spanning every kind of change."""
+    case = service.open_case(command(), idempotency_key="idem-open")
+    run = service.investigate(case.id, prompt_version="prompt-v1", idempotency_key="idem-run")
+    service.record_review(
+        case.id,
+        investigation_id=run.id,
+        target_type=ReviewTargetType.FINDING,
+        target_id=run.findings[0].id,
+        action=ReviewActionKind.ACCEPT,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="checked",
+        idempotency_key="idem-review",
+    )
+    service.decide(
+        case.id,
+        decision=DecisionKind.RESOLVED,
+        actor_id="rev-1",
+        actor_role="reviewer",
+        rationale="confirmed",
+        idempotency_key="idem-decide",
+    )
+
+    kinds = [event.event_type for event in service.list_audit(case.id)]
+    assert kinds == [
+        AuditEventType.CASE_CREATED,
+        AuditEventType.INVESTIGATION_COMPLETED,
+        AuditEventType.REVIEW_RECORDED,
+        AuditEventType.DECISION_RECORDED,
+    ]
+    # Oldest-first is `(occurred_at, id)`; the sequence above is that order, so the
+    # timestamps are non-decreasing and the ids are a stable tiebreak within an instant.
+    timestamps = [event.occurred_at for event in service.list_audit(case.id)]
+    assert timestamps == sorted(timestamps)
+
+
+def test_listing_audit_for_a_missing_case_is_refused(service: CaseService) -> None:
+    """An empty page for a case that does not exist reads as "nothing happened"."""
+    with pytest.raises(CaseNotFoundError):
+        service.list_audit(uuid4())
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle logging
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleLogging:
+    """Each lifecycle change emits one structured event carrying the actor.
+
+    The log is the operational view of the same changes the audit trail records for
+    reviewers. It is asserted separately because a trail that is written and a log
+    that is not leaves an operator blind to a workflow the database can still show.
+    """
+
+    def _events(self, caplog, name: str) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if getattr(r, "event", None) == name]
+
+    def test_opening_logs_the_case_and_the_actor(self, service: CaseService, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="app.services.cases")
+
+        case = service.open_case(command(), actor_id="analyst-1", actor_role="analyst")
+
+        records = self._events(caplog, "case.opened")
+        assert records
+        fields = records[0].fields
+        assert fields["dispute_id"] == str(case.id)
+        assert fields["external_id"] == "DSC-000123"
+        assert fields["actor_id"] == "analyst-1"
+        assert fields["evidence_count"] > 0
+
+    def test_a_replayed_open_is_logged_as_a_replay(
+        self, service: CaseService, caplog
+    ) -> None:
+        original = service.open_case(
+            command(), idempotency_key="idem-1", actor_id="a", actor_role="analyst"
+        )
+        caplog.set_level(logging.INFO, logger="app.services.cases")
+
+        replayed = service.open_case(
+            command(), idempotency_key="idem-1", actor_id="a", actor_role="analyst"
+        )
+
+        assert replayed.id == original.id
+        assert self._events(caplog, "case.open.replayed")
+
+    def test_investigating_logs_the_outcome_and_provenance(
+        self, service: CaseService, caplog
+    ) -> None:
+        case = service.open_case(command())
+        caplog.set_level(logging.INFO, logger="app.services.cases")
+
+        service.investigate(case.id, prompt_version="prompt-v1")
+
+        records = self._events(caplog, "case.investigated")
+        assert records
+        fields = records[0].fields
+        assert fields["provider"] == "mock"
+        assert fields["model"] == "mock-deterministic-v1"
+        assert fields["prompt_version"] == "prompt-v1"
+        assert fields["outcome"] in {"COMPLETE", "DEGRADED", "PARTIAL_FAILED"}
+
+    def test_attaching_new_evidence_logs_the_new_count(
+        self, service: CaseService, caplog
+    ) -> None:
+        case = service.open_case(command())
+        caplog.set_level(logging.INFO, logger="app.services.cases")
+
+        service.attach_records(case.id, payments=[payment()], actor_id="a", actor_role="analyst")
+
+        records = self._events(caplog, "case.evidence.attached")
+        assert records
+        assert records[0].fields["entity_version"] > case.version
+
+    def test_a_noop_attach_logs_nothing_changed(self, service: CaseService, caplog) -> None:
+        case = service.open_case(command())
+        service.attach_records(case.id, payments=[payment()], actor_id="a", actor_role="analyst")
+        caplog.set_level(logging.INFO, logger="app.services.cases")
+        caplog.clear()
+
+        service.attach_records(case.id, payments=[payment()], actor_id="a", actor_role="analyst")
+
+        assert self._events(caplog, "case.evidence.unchanged")
+        assert not self._events(caplog, "case.evidence.attached")
+
+    def test_deciding_logs_the_verdict(
+        self, service: CaseService, caplog
+    ) -> None:
+        case = service.open_case(command())
+        run = service.investigate(case.id, prompt_version="prompt-v1")
+        service.record_review(
+            case.id,
+            investigation_id=run.id,
+            target_type=ReviewTargetType.FINDING,
+            target_id=run.findings[0].id,
+            action=ReviewActionKind.ACCEPT,
+            actor_id="rev-1",
+            actor_role="reviewer",
+            rationale="checked",
+        )
+        caplog.set_level(logging.INFO, logger="app.services.cases")
+
+        service.decide(
+            case.id,
+            decision=DecisionKind.RESOLVED,
+            actor_id="rev-1",
+            actor_role="reviewer",
+            rationale="confirmed",
+        )
+
+        records = self._events(caplog, "case.decided")
+        assert records
+        assert records[0].fields["decision"] == "RESOLVED"
+        assert records[0].fields["actor_id"] == "rev-1"
+
+
+# ---------------------------------------------------------------------------
+# Investigation recovery (Part 7)
+# ---------------------------------------------------------------------------
+
+
+class FlakyProvider:
+    """Fails a fixed number of times, then answers like the mock provider.
+
+    The mock provider can only fail every call or none; retrying needs both, so this
+    wrapper is what lets a test observe the retry actually happening.
+    """
+
+    def __init__(self, failures: int, *, error: type[Exception] = LlmTimeoutError) -> None:
+        self._remaining = failures
+        self._error = error
+        self._delegate = MockLlmProvider()
+        self.name = self._delegate.name
+        self.model = self._delegate.model
+
+    def structured_infer(self, request):  # type: ignore[no-untyped-def]
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise self._error("transient provider failure")
+        return self._delegate.structured_infer(request)
+
+
+class ObservingProvider:
+    """Records the stored case at the moment the workflow runs.
+
+    Used to prove the write-ahead marker is durable *before* the provider is called,
+    which is the whole point of ADR-008.
+    """
+
+    def __init__(self, repository: InMemoryCaseRepository) -> None:
+        self._repository = repository
+        self._delegate = MockLlmProvider()
+        self.name = self._delegate.name
+        self.model = self._delegate.model
+        self._case_id: UUID | None = None
+        self.during: list[DisputeCase] = []
+
+    def watch(self, case_id: UUID) -> None:
+        self._case_id = case_id
+
+    def structured_infer(self, request):  # type: ignore[no-untyped-def]
+        assert self._case_id is not None
+        self.during.append(self._repository.get(self._case_id))
+        return self._delegate.structured_infer(request)
+
+
+def pending_record(
+    case: DisputeCase,
+    *,
+    version: int = 1,
+    expires_at: datetime | None = None,
+) -> InvestigationRecord:
+    return InvestigationRecord(
+        id=uuid4(),
+        dispute_id=case.id,
+        version=version,
+        status=InvestigationRunStatus.PENDING,
+        evidence_fingerprint=case.evidence_fingerprint,
+        created_at=datetime.now(timezone.utc),
+        summary="",
+        provider_name="mock",
+        model="mock-deterministic-v1",
+        prompt_version="",
+        engine_version="",
+        evidence=case.evidence,
+        stage_status={"overall": "PENDING"},
+        expires_at=expires_at,
+    )
+
+
+def test_the_pending_marker_is_durable_before_the_workflow_runs() -> None:
+    """The write-ahead half of ADR-008: a crash mid-run leaves a recoverable trace."""
+    repository = InMemoryCaseRepository()
+    provider = ObservingProvider(repository)
+    service = CaseService(repository, provider)
+    case = service.open_case(command())
+    provider.watch(case.id)
+
+    service.investigate(case.id, prompt_version="prompt-v1")
+
+    during = provider.during[0]
+    assert during.status is CaseStatus.INVESTIGATING
+    pending = [run for run in during.investigations if run.is_pending]
+    assert len(pending) == 1
+    # And the marker does not survive a successful run as a second row: the terminal
+    # write lands on the pending row rather than adding one.
+    stored = service.get(case.id)
+    assert [run.status for run in stored.investigations] == [InvestigationRunStatus.COMPLETE]
+
+
+def test_a_transient_failure_is_retried_until_it_succeeds() -> None:
+    service = CaseService(InMemoryCaseRepository(), FlakyProvider(1), max_attempts=3)
+    case = service.open_case(command())
+
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+
+    assert run.status is InvestigationRunStatus.COMPLETE
+    assert run.attempts == 2
+    assert service.get(case.id).status is CaseStatus.AWAITING_REVIEW
+
+
+def test_a_permanent_failure_is_not_retried() -> None:
+    """An unparseable answer will not parse on the second attempt either."""
+    service = CaseService(
+        InMemoryCaseRepository(), MockLlmProvider(corrupt_response=True), max_attempts=3
+    )
+    case = service.open_case(command())
+
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+
+    assert run.status is InvestigationRunStatus.PARTIAL_FAILED
+    assert run.attempts == 1
+
+
+def test_an_exhausted_budget_completes_with_the_last_result_not_failed() -> None:
+    """The deterministic figures are never thrown away over a flaky model."""
+    service = CaseService(
+        InMemoryCaseRepository(), MockLlmProvider(fail_with=LlmTimeoutError), max_attempts=2
+    )
+    case = service.open_case(command())
+
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+
+    assert run.status is InvestigationRunStatus.DEGRADED
+    assert run.attempts == 2
+    assert run.calculation is not None
+    assert not run.findings
+
+
+def test_list_recoverable_finds_a_pending_run_past_the_window() -> None:
+    repository = InMemoryCaseRepository()
+    service = CaseService(repository, MockLlmProvider())
+    case = service.open_case(command())
+    pending = pending_record(case)
+    repository.save(case.with_pending_investigation(pending), expected_version=case.version)
+
+    found = service.list_recoverable_investigations(
+        older_than=pending.created_at + timedelta(hours=1)
+    )
+
+    assert found == ((case.id, pending.id),)
+    assert (
+        service.list_recoverable_investigations(older_than=pending.created_at - timedelta(hours=1))
+        == ()
+    )
+
+
+def test_failing_an_interrupted_run_records_it_and_reopens_the_case() -> None:
+    repository = InMemoryCaseRepository()
+    service = CaseService(repository, MockLlmProvider())
+    case = service.open_case(command())
+    pending = pending_record(case)
+    repository.save(case.with_pending_investigation(pending), expected_version=case.version)
+
+    service.fail_interrupted_investigation(case.id, pending.id)
+
+    stored = service.get(case.id)
+    assert stored.investigations[0].status is InvestigationRunStatus.FAILED
+    assert stored.status is CaseStatus.OPEN
+    assert [event.event_type for event in service.list_audit(case.id)] == [
+        AuditEventType.CASE_CREATED,
+        AuditEventType.INVESTIGATION_FAILED,
+    ]
+
+
+def test_resuming_completes_the_pending_run_in_place() -> None:
+    """No second marker: the run keeps its identity, so the case gains no duplicate."""
+    repository = InMemoryCaseRepository()
+    service = CaseService(repository, MockLlmProvider())
+    case = service.open_case(command())
+    pending = pending_record(case)
+    repository.save(case.with_pending_investigation(pending), expected_version=case.version)
+
+    run = service.resume_investigation(case.id, prompt_version="prompt-v1")
+
+    assert run.id == pending.id
+    assert run.version == pending.version
+    assert run.status is InvestigationRunStatus.COMPLETE
+    stored = service.get(case.id)
+    assert len(stored.investigations) == 1
+    assert stored.status is CaseStatus.AWAITING_REVIEW
+    assert stored.version == case.version + 1
+
+
+def test_resuming_without_a_pending_run_is_refused(service: CaseService) -> None:
+    case = service.open_case(command())
+
+    with pytest.raises(CaseTransitionError, match="no pending investigation"):
+        service.resume_investigation(case.id, prompt_version="prompt-v1")
+
+
+def test_resuming_over_evidence_that_moved_fails_the_run() -> None:
+    repository = InMemoryCaseRepository()
+    service = CaseService(repository, MockLlmProvider())
+    case = service.open_case(command())
+    pending = pending_record(case)
+    repository.save(case.with_pending_investigation(pending), expected_version=case.version)
+    service.attach_records(case.id, payments=[payment()], actor_id="a", actor_role="analyst")
+
+    with pytest.raises(CaseTransitionError, match="evidence changed"):
+        service.resume_investigation(case.id, prompt_version="prompt-v1")
+
+    stored = service.get(case.id)
+    assert any(run.status is InvestigationRunStatus.FAILED for run in stored.investigations)
+    # The case is investigable again rather than stuck mid-run. New evidence had already
+    # reopened it; the failure leaves that in place rather than forcing it to OPEN.
+    assert stored.is_open_for_investigation is True
+

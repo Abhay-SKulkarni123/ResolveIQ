@@ -45,9 +45,11 @@ MIGRATIONS_DIR = BACKEND_ROOT / "migrations"
 #: the drift being looked for.
 MANAGED_TABLES = (
     "accounts",
+    "audit_events",
     "calculations",
     "contract_price_terms",
     "contracts",
+    "dispute_decisions",
     "dispute_evidence_items",
     "disputes",
     "finding_reviews",
@@ -67,6 +69,7 @@ TIMESTAMPED_TABLES = (
     "calculations",
     "contract_price_terms",
     "contracts",
+    "dispute_decisions",
     "disputes",
     "finding_reviews",
     "investigation_findings",

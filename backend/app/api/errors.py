@@ -42,6 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.domain.cases import CaseTransitionError
 from app.domain.evidence import EvidenceError
+from app.logging_config import current_request_id, error_category, log_event
 from app.ports.cases import CaseConflictError, CaseNotFoundError
 from app.services.cases import CaseNotInvestigableError
 from app.services.source_document import SourceDocumentError
@@ -49,6 +50,21 @@ from app.services.source_document import SourceDocumentError
 __all__ = ["ApiError", "error_response", "install_error_handlers"]
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _log_error(status_code: int, code: str, exc: BaseException | None = None) -> None:
+    """Record one handled failure, without ever copying the exception message.
+
+    The exception's *category* is logged and its message is not: a message can carry
+    request-supplied text or a model's raw output, and a log is the wrong place for
+    either. ``str(exc)`` is what the caller already received; the log only needs to
+    say what class of failure this was and what code the caller was given.
+    """
+    level = logging.ERROR if status_code >= 500 else logging.WARNING
+    fields: dict[str, Any] = {"status_code": status_code, "code": code}
+    if exc is not None:
+        fields["error_category"] = error_category(exc)
+    log_event(LOGGER, level, "api.error.responded", **fields)
 
 
 class ApiError(Exception):
@@ -83,7 +99,11 @@ def error_response(
                 "code": code,
                 "message": message,
                 "details": details or {},
-                "request_id": str(uuid4()),
+                # The correlation id of the request being handled, so the envelope,
+                # the response header and the server log all name the same request.
+                # A fresh uuid is the fallback for a response built outside a request
+                # (a direct call in a test); there is no request to correlate then.
+                "request_id": current_request_id() or str(uuid4()),
             }
         },
     )
@@ -103,10 +123,12 @@ def install_error_handlers(application: FastAPI) -> None:
         # unregistered it would escape as an unhandled exception, and FastAPI's
         # default 500 body does not match the documented error shape -- so a
         # malformed id would look like a server fault to every client.
+        _log_error(exc.status_code, exc.code, exc)
         return error_response(exc.status_code, exc.code, exc.message, exc.details)
 
     @application.exception_handler(CaseNotFoundError)
     def _not_found(_: Request, exc: CaseNotFoundError) -> JSONResponse:
+        _log_error(404, "DISPUTE_NOT_FOUND", exc)
         return error_response(404, "DISPUTE_NOT_FOUND", str(exc))
 
     @application.exception_handler(CaseConflictError)
@@ -114,30 +136,45 @@ def install_error_handlers(application: FastAPI) -> None:
         # 409 with a code of its own rather than the generic TRANSITION one: this is a
         # write-write race, and the frontend's response is to re-read, not to explain
         # that the case is in the wrong state.
+        _log_error(409, "VERSION_CONFLICT", exc)
         return error_response(409, "VERSION_CONFLICT", str(exc))
 
     @application.exception_handler(CaseTransitionError)
     def _transition(_: Request, exc: CaseTransitionError) -> JSONResponse:
+        _log_error(409, "INVALID_TRANSITION", exc)
         return error_response(409, "INVALID_TRANSITION", str(exc))
 
     @application.exception_handler(CaseNotInvestigableError)
     def _not_investigable(_: Request, exc: CaseNotInvestigableError) -> JSONResponse:
+        _log_error(422, "NOT_INVESTIGABLE", exc)
         return error_response(422, "NOT_INVESTIGABLE", str(exc))
 
     @application.exception_handler(SourceDocumentError)
     def _source_document(_: Request, exc: SourceDocumentError) -> JSONResponse:
+        _log_error(422, "INVALID_INGEST_PAYLOAD", exc)
         return error_response(422, "INVALID_INGEST_PAYLOAD", str(exc))
 
     @application.exception_handler(EvidenceError)
     def _evidence(_: Request, exc: EvidenceError) -> JSONResponse:
+        _log_error(422, "INVALID_EVIDENCE", exc)
         return error_response(422, "INVALID_EVIDENCE", str(exc))
 
     @application.exception_handler(OperationalError)
     def _database_down(_: Request, exc: OperationalError) -> JSONResponse:
-        # Logged with the driver detail, returned without it. The connection string
-        # can contain a password, and an error body is the last place that should
-        # start leaking one (NEP-009).
-        LOGGER.error("database unavailable: %s", exc, exc_info=True)
+        # Logged with the driver detail and a traceback, returned without either. The
+        # connection string can contain a password, and an error body is the last
+        # place that should start leaking one (NEP-009). The category is a field; the
+        # traceback is kept because a 503 from the database is exactly the failure a
+        # stack is useful for.
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "api.error.responded",
+            exc_info=True,
+            status_code=503,
+            code="DATABASE_UNAVAILABLE",
+            error_category=error_category(exc),
+        )
         return error_response(
             503,
             "DATABASE_UNAVAILABLE",
@@ -147,6 +184,7 @@ def install_error_handlers(application: FastAPI) -> None:
 
     @application.exception_handler(RequestValidationError)
     def _validation(_: Request, exc: RequestValidationError) -> JSONResponse:
+        _log_error(422, "VALIDATION_FAILED", exc)
         return error_response(
             422,
             "VALIDATION_FAILED",
@@ -167,6 +205,7 @@ def install_error_handlers(application: FastAPI) -> None:
             404: "NOT_FOUND",
             405: "METHOD_NOT_ALLOWED",
         }.get(exc.status_code, "HTTP_ERROR")
+        _log_error(exc.status_code, code, exc)
         return error_response(
             exc.status_code,
             code,

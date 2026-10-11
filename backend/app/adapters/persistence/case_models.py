@@ -21,15 +21,30 @@ for everything Phase 4 needs and nothing it does not:
     What the run produced, with the engine-computed impact on the hypotheses.
 ``finding_reviews``
     A reviewer's append-only annotation on one of those.
+``dispute_decisions``
+    A reviewer's closing verdict on the case: ``RESOLVED`` or ``REJECTED``, with
+    actor, rationale and the evidence fingerprint it judged. Append-only; no
+    money.
 
 Deliberate omissions
 --------------------
 ``adjustments``, ``review_decisions`` and ``audit_events`` are in §3.3 and are
-**not** here. Approving and moving money is a later phase, and the tables would
-carry the unique constraints and decision vocabulary that phase is supposed to
-design. ``review_decisions`` in particular is not "review annotations with an
-approve flag": approval needs the idempotency and separation-of-duties rules of
-§9.3, and a half-built version invites someone to wire the button up.
+**not** here. ``dispute_decisions`` (added in migration 0003) records the closing
+verdict and moves no money; applying an amount or executing an adjustment is the
+idempotent resolution phase, and the tables would carry the unique constraints
+and decision vocabulary that phase is supposed to design. ``review_decisions`` in
+particular is not "a decision with an approve flag": executing money needs the
+idempotency and separation-of-duties rules of §9.3, and a half-built version
+invites someone to wire the button up.
+
+Idempotency keys
+----------------
+Migration 0004 adds an optional ``idempotency_key`` to ``disputes``,
+``investigations``, ``finding_reviews`` and ``dispute_decisions``, each unique
+when present. This is the generic replay guard from §9.3 layer 1 -- it makes a
+*retried request* with the same ``Idempotency-Key`` return the row it already
+created instead of creating a second one. It does not, on its own, decide whether
+money moves: that remains the separate resolution phase above.
 
 Why evidence rows are not a foreign key on ``investigations``
 ------------------------------------------------------------
@@ -132,6 +147,7 @@ __all__ = [
     "NUMERIC_MONEY",
     "NUMERIC_PROBABILITY",
     "CalculationRow",
+    "DisputeDecisionRow",
     "DisputeEvidenceRow",
     "DisputeRow",
     "FindingReviewRow",
@@ -153,9 +169,10 @@ NUMERIC_PROBABILITY: Final[tuple[int, int]] = (5, 4)
 
 _CASE_STATUSES: Final[str] = "'OPEN','INVESTIGATING','AWAITING_REVIEW','RESOLVED','REJECTED','REOPENED'"
 _CASE_SEVERITIES: Final[str] = "'LOW','MEDIUM','HIGH','CRITICAL'"
-_RUN_STATUSES: Final[str] = "'PENDING','COMPLETE','DEGRADED','PARTIAL_FAILED'"
+_RUN_STATUSES: Final[str] = "'PENDING','COMPLETE','DEGRADED','PARTIAL_FAILED','FAILED'"
 _REVIEW_ACTIONS: Final[str] = "'ACCEPT','REJECT','REQUEST_MORE_INFO','AMEND'"
 _REVIEW_TARGETS: Final[str] = "'FINDING','HYPOTHESIS','RESOLUTION_OPTION'"
+_DECISION_VALUES: Final[str] = "'RESOLVED','REJECTED'"
 
 #: Stored snapshots are JSONB, not JSON. Snapshot contents are queried --
 #: "every case citing this contract term" is a real review question -- and JSONB
@@ -222,6 +239,10 @@ class DisputeRow(UuidPrimaryKeyMixin, Base):
     version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("1")
     )
+    #: The ``Idempotency-Key`` the case was opened with (migration 0004). Nullable: a
+    #: case may be created without a key. Unique when present, so a retried open
+    #: cannot create a second case for the same request.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -231,6 +252,7 @@ class DisputeRow(UuidPrimaryKeyMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("external_id", name="uq_disputes_external_id"),
+        UniqueConstraint("idempotency_key", name="uq_disputes_idempotency_key"),
         CheckConstraint("TRIM(external_id) <> ''", name="external_id_not_blank"),
         CheckConstraint("TRIM(invoice_external_id) <> ''", name="invoice_external_id_not_blank"),
         CheckConstraint(f"status IN ({_CASE_STATUSES})", name="status_is_known"),
@@ -383,12 +405,17 @@ class InvestigationRow(UuidPrimaryKeyMixin, Base):
     degradations: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
     stale_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: The ``Idempotency-Key`` this run was requested with (migration 0004), so a
+    #: retried "run investigation" replays the existing run instead of creating a
+    #: second version. Unique when present.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     __table_args__ = (
         UniqueConstraint("dispute_id", "version", name="uq_investigations_dispute_id_version"),
+        UniqueConstraint("idempotency_key", name="uq_investigations_idempotency_key"),
         CheckConstraint("version >= 1", name="version_is_positive"),
         CheckConstraint(f"status IN ({_RUN_STATUSES})", name="status_is_known"),
         CheckConstraint(
@@ -584,10 +611,12 @@ class FindingReviewRow(UuidPrimaryKeyMixin, Base):
     on, :meth:`DisputeCase.with_review` refuses the annotation rather than
     recording a judgement against superseded evidence.
 
-    ``actor_role`` is stored and never trusted for authorisation. Phase 4 has no
+    ``actor_role`` is stored and not trusted for authorisation. Phase 4 has no
     authentication at all (development identity only), and a column that looks like
     an authorisation input is an invitation to build one on top of it before the
-    separation-of-duties rules exist.
+    separation-of-duties rules exist. The lifecycle verdict in
+    ``dispute_decisions`` is the one place the API layer checks ``actor_role``,
+    and it checks the request header there rather than this stored column.
     """
 
     __tablename__ = "finding_reviews"
@@ -606,11 +635,16 @@ class FindingReviewRow(UuidPrimaryKeyMixin, Base):
     evidence_fingerprint_seen: Mapped[str] = mapped_column(String(71), nullable=False)
     rationale: Mapped[str] = mapped_column(Text, nullable=False)
     amended_narrative: Mapped[str | None] = mapped_column(Text)
+    #: The ``Idempotency-Key`` this annotation was recorded with (migration 0004).
+    #: Unique when present, which is what stops a retried review from being stored
+    #: twice as two identical rows.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_finding_reviews_idempotency_key"),
         CheckConstraint(f"action IN ({_REVIEW_ACTIONS})", name="action_is_known"),
         CheckConstraint(f"target_type IN ({_REVIEW_TARGETS})", name="target_type_is_known"),
         CheckConstraint("TRIM(actor_id) <> ''", name="actor_id_not_blank"),
@@ -628,4 +662,57 @@ class FindingReviewRow(UuidPrimaryKeyMixin, Base):
         ),
         Index("ix_finding_reviews_dispute_id_created_at", "dispute_id", "created_at"),
         Index("ix_finding_reviews_target", "target_type", "target_id"),
+    )
+
+
+class DisputeDecisionRow(UuidPrimaryKeyMixin, Base):
+    """A reviewer's closing verdict on a case: resolved or rejected.
+
+    Append-only, like ``finding_reviews``. ``decision`` must be one of
+    ``RESOLVED``/``REJECTED`` (checked), ``rationale`` is mandatory (checked) and
+    ``evidence_fingerprint_seen`` records the exact view of the facts the verdict
+    was based on, mirroring the freshness device on ``finding_reviews``.
+
+    The row deliberately carries no amount. Closing a case and moving money are
+    separate records: the verdict sets the lifecycle, and executing an adjustment
+    is the idempotent resolution phase with its own tables.
+
+    There is no uniqueness constraint on ``dispute_id``. Double-resolution is
+    prevented by the aggregate's optimistic ``version`` predicate at ``save``
+    time, which is transaction-safe where a unique row would also make a
+    reopened-and-re-decided case impossible to record twice. The
+    ``idempotency_key`` unique constraint added in migration 0004 is the second
+    layer: a retried request carrying the same key replays the stored verdict
+    rather than inserting a duplicate.
+    """
+
+    __tablename__ = "dispute_decisions"
+
+    dispute_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("disputes.id", ondelete="RESTRICT"), nullable=False
+    )
+    investigation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("investigations.id", ondelete="RESTRICT"), nullable=False
+    )
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_fingerprint_seen: Mapped[str] = mapped_column(String(71), nullable=False)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The ``Idempotency-Key`` this verdict was recorded with (migration 0004).
+    idempotency_key: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_dispute_decisions_idempotency_key"),
+        CheckConstraint(f"decision IN ({_DECISION_VALUES})", name="decision_is_known"),
+        CheckConstraint("TRIM(actor_id) <> ''", name="actor_id_not_blank"),
+        CheckConstraint("TRIM(rationale) <> ''", name="rationale_not_blank"),
+        CheckConstraint(
+            is_sha256_fingerprint("evidence_fingerprint_seen"),
+            name="fingerprint_is_sha256",
+        ),
+        Index("ix_dispute_decisions_dispute_id_created_at", "dispute_id", "created_at"),
     )

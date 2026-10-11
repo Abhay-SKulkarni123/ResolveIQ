@@ -33,7 +33,9 @@ from app.domain.cases import (
     CaseSeverity,
     CaseStatus,
     CaseTransitionError,
+    DecisionKind,
     DisputeCase,
+    DisputeDecision,
     InvestigationRecord,
     InvestigationRunStatus,
     ReviewAction,
@@ -409,6 +411,28 @@ def review_for(
     }
     fields.update(overrides)
     return ReviewAction(**fields)  # type: ignore[arg-type]
+
+
+def decision_for(
+    case: DisputeCase,
+    run: InvestigationRecord,
+    *,
+    decision: DecisionKind = DecisionKind.RESOLVED,
+    **overrides: object,
+) -> DisputeDecision:
+    fields: dict[str, object] = {
+        "id": uuid4(),
+        "dispute_id": case.id,
+        "investigation_id": run.id,
+        "decision": decision,
+        "actor_id": "rev-1",
+        "actor_role": "reviewer",
+        "evidence_fingerprint_seen": case.evidence_fingerprint,
+        "created_at": NOW,
+        "rationale": "run reviewed; resolved",
+    }
+    fields.update(overrides)
+    return DisputeDecision(**fields)  # type: ignore[arg-type]
 
 
 def test_a_review_is_refused_when_its_investigation_is_stale() -> None:
@@ -815,3 +839,335 @@ def test_a_run_with_a_skipped_version_is_refused() -> None:
 
     with pytest.raises(CaseTransitionError, match="expected investigation version 1"):
         case.with_investigation(make_run(case, version=7))
+
+
+# ---------------------------------------------------------------------------
+# Deciding a case: the closing verdict
+# ---------------------------------------------------------------------------
+
+
+def _reviewed_case() -> tuple[DisputeCase, InvestigationRecord]:
+    """An ``AWAITING_REVIEW`` case whose current run has been convened and reviewed."""
+    case = make_case()
+    original = finding()
+    case = case.with_investigation(make_run(case, findings=(original,)))
+    case = case.with_review(review_for(case, case.current_investigation, original.id))
+    assert case.status is CaseStatus.AWAITING_REVIEW
+    return case, case.current_investigation
+
+
+def test_a_reviewed_case_can_be_decided_resolved() -> None:
+    """The verdict that is meant to close a case actually closes it."""
+    case, run = _reviewed_case()
+    verdict = decision_for(case, run)
+
+    decided = case.decided(verdict)
+
+    assert decided.decisions == (verdict,)
+    assert decided.status is CaseStatus.RESOLVED
+    assert decided.version == case.version + 1
+
+
+def test_a_reviewed_case_can_be_decided_rejected() -> None:
+    """``REJECTED`` and ``RESOLVED`` are both reachable closings."""
+    case, run = _reviewed_case()
+    verdict = decision_for(case, run, decision=DecisionKind.REJECTED)
+
+    decided = case.decided(verdict)
+
+    assert decided.status is CaseStatus.REJECTED
+    assert decided.decisions[0].decision is DecisionKind.REJECTED
+
+
+def test_a_case_is_refused_a_decision_before_any_review() -> None:
+    """A verdict on a run nobody has looked at is not a review, it is an order."""
+    case = make_case()
+    run = make_run(case)
+    case = case.with_investigation(run)
+    assert case.status is CaseStatus.AWAITING_REVIEW
+
+    with pytest.raises(CaseTransitionError, match="before the run under review has been reviewed"):
+        case.decided(decision_for(case, run))
+
+
+def test_a_decision_is_refused_outside_awaiting_review() -> None:
+    """Only the run that is *under review* can be the run that is decided."""
+    case, run = _reviewed_case()
+    decided = case.decided(decision_for(case, run))
+
+    with pytest.raises(CaseTransitionError, match="only while it awaits review"):
+        decided.decided(decision_for(decided, run))
+
+
+def test_a_decision_must_target_the_current_run() -> None:
+    """A verdict against a superseded run would judge evidence no longer attached."""
+    case, run = _reviewed_case()
+    old_run, newcomer = run, replace(run, id=uuid4(), version=2)
+    case = case.with_investigation(newcomer)
+
+    with pytest.raises(CaseTransitionError, match="currently under review"):
+        case.decided(decision_for(case, old_run))
+
+
+def test_a_decision_is_refused_over_stale_evidence() -> None:
+    """New evidence that would make the run stale also re-opens the case.
+
+    The verdict must not ride superseded evidence. Here the refusal surfaces as the
+    status guard (new evidence moves the case to ``REOPENED``, which is not awaiting
+    review), which is the same invariant from the other side: a case that has moved
+    on is exactly the case the verdict is refused for.
+    """
+    case, run = _reviewed_case()
+    stale_case = add_payment(case)
+    assert stale_case.is_stale is True
+    assert stale_case.status is CaseStatus.REOPENED
+
+    with pytest.raises(CaseTransitionError, match="only while it awaits review"):
+        stale_case.decided(decision_for(stale_case, run))
+
+
+def test_a_decided_case_keeps_every_decision_in_order() -> None:
+    """Two verdicts on one history (reopen, re-decide) are both preserved."""
+    case, run = _reviewed_case()
+    first = decision_for(case, run, rationale="first verdict")
+    case = case.decided(first)
+    case = case.reopened(reason="new evidence", at=NOW)
+    run = make_run(case, version=2, findings=(finding(),))
+    case = case.with_investigation(run)
+    case = case.with_review(review_for(case, run, run.findings[0].id))
+    second = decision_for(case, run, rationale="second verdict after reopen")
+    case = case.decided(second)
+
+    assert [d.rationale for d in case.decisions] == [
+        "first verdict",
+        "second verdict after reopen",
+    ]
+    assert case.status is CaseStatus.RESOLVED
+
+
+def test_a_decision_requires_a_non_blank_actor() -> None:
+    """The stored verdict must name the person who made it."""
+    case, run = _reviewed_case()
+
+    with pytest.raises(ValueError, match="actor_id"):
+        decision_for(case, run, actor_id="   ")
+
+
+def test_a_decision_requires_a_rationale() -> None:
+    """A closing verdict with no reason cannot be read against its annotations."""
+    case, run = _reviewed_case()
+
+    with pytest.raises(ValueError, match="rationale"):
+        decision_for(case, run, rationale="  ")
+
+
+# ---------------------------------------------------------------------------
+# Write-ahead investigation lifecycle (Part 7)
+# ---------------------------------------------------------------------------
+
+
+def pending_run(
+    case: DisputeCase,
+    *,
+    version: int = 1,
+    fingerprint: str | None = None,
+    created_at: datetime | None = None,
+    stages: dict[str, str] | None = None,
+) -> InvestigationRecord:
+    return InvestigationRecord(
+        id=uuid4(),
+        dispute_id=case.id,
+        version=version,
+        status=InvestigationRunStatus.PENDING,
+        evidence_fingerprint=fingerprint or case.evidence_fingerprint,
+        created_at=created_at or NOW,
+        summary="",
+        provider_name="mock",
+        model="mock-deterministic-v1",
+        prompt_version="",
+        engine_version="",
+        evidence=case.evidence,
+        stage_status=(
+            {"overall": "PENDING", "stages": stages} if stages is not None else {"overall": "PENDING"}
+        ),
+    )
+
+
+def test_a_pending_marker_records_the_run_without_bumping_the_version() -> None:
+    """The marker changes the case's meaning (a run is in flight) but not its token.
+
+    Bumping ``version`` on start would invalidate the token a caller holds from the
+    previous response for a request whose outcome they have not yet seen.
+    """
+    case = make_case()
+    pending = pending_run(case)
+
+    started = case.with_pending_investigation(pending)
+
+    assert started.status is CaseStatus.INVESTIGATING
+    assert started.version == case.version
+    assert started.investigations[-1] is pending
+
+
+def test_a_second_pending_run_is_refused() -> None:
+    """Two in-flight starts would leave the case with no deterministic resolution."""
+    case = make_case()
+    started = case.with_pending_investigation(pending_run(case))
+
+    with pytest.raises(CaseTransitionError, match="already has a pending investigation"):
+        started.with_pending_investigation(pending_run(started, version=2))
+
+
+def test_a_write_ahead_marker_must_be_pending() -> None:
+    """The whole design rests on the marker being non-terminal when it is written."""
+    case = make_case()
+
+    with pytest.raises(CaseTransitionError, match="must be PENDING"):
+        case.with_pending_investigation(
+            replace(pending_run(case), status=InvestigationRunStatus.COMPLETE)
+        )
+
+
+def test_a_write_ahead_marker_over_foreign_evidence_is_refused() -> None:
+    """A run that read evidence the case does not have would attest to nothing."""
+    case = make_case()
+
+    with pytest.raises(CaseTransitionError, match="no longer attached"):
+        case.with_pending_investigation(pending_run(case, fingerprint="sha256:other"))
+
+
+def test_completing_a_pending_run_replaces_it_and_moves_to_review() -> None:
+    case = make_case()
+    pending = pending_run(case)
+    started = case.with_pending_investigation(pending)
+
+    completed = replace(
+        pending,
+        status=InvestigationRunStatus.COMPLETE,
+        summary="done",
+        stage_status={"overall": "COMPLETE"},
+    )
+    finished = started.complete_investigation(completed)
+
+    assert finished.status is CaseStatus.AWAITING_REVIEW
+    assert finished.version == case.version + 1
+    assert finished.current_investigation_id == pending.id
+    assert len(finished.investigations) == 1
+    assert finished.investigations[0].status is InvestigationRunStatus.COMPLETE
+
+
+def test_a_run_cannot_be_completed_twice() -> None:
+    """The one-way edge: a replayed completion is a refusal, not a duplicate result."""
+    case = make_case()
+    pending = pending_run(case)
+    started = case.with_pending_investigation(pending)
+    completed = replace(pending, status=InvestigationRunStatus.COMPLETE)
+    finished = started.complete_investigation(completed)
+
+    with pytest.raises(CaseTransitionError, match="only a pending investigation"):
+        finished.complete_investigation(completed)
+
+
+def test_completion_must_keep_the_pending_version() -> None:
+    """The terminal write lands on the row the marker created, at that row's version."""
+    case = make_case()
+    pending = pending_run(case)
+    started = case.with_pending_investigation(pending)
+
+    with pytest.raises(CaseTransitionError, match="must keep version"):
+        started.complete_investigation(
+            replace(
+                pending,
+                status=InvestigationRunStatus.COMPLETE,
+                version=pending.version + 1,
+            )
+        )
+
+
+def test_failing_a_pending_run_returns_the_case_to_open() -> None:
+    """An abandoned run must not pin the case in ``INVESTIGATING`` forever."""
+    case = make_case()
+    pending = pending_run(case)
+    started = case.with_pending_investigation(pending)
+
+    failed = started.fail_investigation(pending.id, reason="the worker died")
+
+    run = failed.investigations[0]
+    assert run.status is InvestigationRunStatus.FAILED
+    assert run.failure_reason == "the worker died"
+    assert failed.status is CaseStatus.OPEN
+    assert failed.version == case.version + 1
+
+
+def test_a_completed_run_cannot_be_failed() -> None:
+    """Only an in-flight run is recoverable; a finished one is history."""
+    case = make_case()
+    run = make_run(case)
+    case = case.with_investigation(run)
+
+    with pytest.raises(CaseTransitionError, match="not pending"):
+        case.fail_investigation(run.id, reason="too late")
+
+
+def test_failing_requires_a_reason() -> None:
+    case = make_case()
+    pending = pending_run(case)
+    started = case.with_pending_investigation(pending)
+
+    with pytest.raises(ValueError, match="reason"):
+        started.fail_investigation(pending.id, reason="   ")
+
+
+def test_resume_from_names_the_first_incomplete_stage() -> None:
+    """The point of per-stage status: a recovery skips what already ran."""
+    case = make_case()
+    pending = pending_run(
+        case,
+        stages={
+            "COLLECTING_EVIDENCE": "COMPLETE",
+            "INTERPRETING": "DEGRADED",
+            "COMPUTING_IMPACT": "COMPLETE",
+            "PROPOSING_RESOLUTIONS": "PENDING",
+        },
+    )
+
+    assert pending.resume_from == "INTERPRETING"
+
+
+def test_a_finished_run_resumes_from_nothing() -> None:
+    case = make_case()
+    run = replace(
+        make_run(case),
+        stage_status={
+            "overall": "COMPLETE",
+            "stages": {
+                "COLLECTING_EVIDENCE": "COMPLETE",
+                "INTERPRETING": "COMPLETE",
+                "COMPUTING_IMPACT": "COMPLETE",
+                "PROPOSING_RESOLUTIONS": "COMPLETE",
+            },
+        },
+    )
+
+    assert run.resume_from is None
+
+
+def test_a_run_with_no_recorded_stages_resumes_from_the_start() -> None:
+    case = make_case()
+
+    assert pending_run(case).resume_from == "COLLECTING_EVIDENCE"
+
+
+def test_a_run_expires_at_its_ttl() -> None:
+    case = make_case()
+    run = replace(pending_run(case), expires_at=NOW + timedelta(hours=24))
+
+    assert run.is_expired(NOW + timedelta(hours=23)) is False
+    assert run.is_expired(NOW + timedelta(hours=24)) is True
+    assert run.is_expired(NOW + timedelta(hours=25)) is True
+
+
+def test_a_run_without_a_ttl_never_expires() -> None:
+    """The TTL is opt-in; an unbounded run is a configuration, not a bug."""
+    case = make_case()
+    assert pending_run(case).is_expired(NOW + timedelta(days=3650)) is False

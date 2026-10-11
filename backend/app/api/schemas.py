@@ -34,6 +34,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     "AttachEvidenceRequest",
+    "AuditEventResponse",
+    "AuditHistoryResponse",
     "CalculationResponse",
     "CaseListResponse",
     "CaseSummaryResponse",
@@ -214,9 +216,12 @@ class ReopenRequest(_Model):
 class ReviewRequest(_Model):
     """A reviewer's annotation on one finding, hypothesis or option.
 
-    There is no ``approve``. Approval moves money and arrives with the idempotency
-    and separation-of-duties rules of docs/SYSTEM_DESIGN.md §9.3; offering the verb
-    before those exist is how a button gets wired up without its guard.
+    There is no ``approve``. Applying an amount moves money and arrives with the
+    idempotency and separation-of-duties rules of docs/SYSTEM_DESIGN.md §9.3;
+    offering the verb before those exist is how a button gets wired up without its
+    guard. Closing a case is ``disputes/{id}/decision``, which is the same Phase 4
+    workflow but a different record: it sets the lifecycle and still moves no
+    money.
     """
 
     investigation_id: str
@@ -225,6 +230,22 @@ class ReviewRequest(_Model):
     action: Literal["ACCEPT", "REJECT", "REQUEST_MORE_INFO", "AMEND"]
     rationale: Annotated[str, Field(max_length=4000)] = ""
     amended_narrative: Annotated[str, Field(max_length=4000)] | None = None
+
+
+class DecisionRequest(_Model):
+    """A reviewer's verdict that closes the case: resolved or rejected.
+
+    ``rationale`` is mandatory because the verdict leaves no other record of *why*
+    -- the annotations live on the run and the decision is only actionable if it
+    can be read against them.
+
+    Deliberately sparse: no amount, no approve verb. A decision moves the lifecycle
+    and moves no money; applying an amount is the idempotent resolution phase with
+    its own request type.
+    """
+
+    decision: Literal["RESOLVED", "REJECTED"]
+    rationale: Annotated[str, Field(min_length=1, max_length=4000)]
 
 
 AttachEvidenceRequest.model_rebuild()
@@ -356,6 +377,23 @@ class ReviewResponse(_Model):
     is_against_current_evidence: bool
 
 
+class DecisionResponse(_Model):
+    """The recorded closing verdict. Reflects :class:`DisputeDecision`.
+
+    ``amount`` is absent by design: this record closes the case and the
+    idempotent resolution phase records the money separately.
+    """
+
+    id: str
+    investigation_id: str
+    decision: Literal["RESOLVED", "REJECTED"]
+    actor_id: str
+    actor_role: str
+    rationale: str
+    evidence_fingerprint_seen: str
+    created_at: datetime
+
+
 class CaseSummaryResponse(_Model):
     """One row of the dispute list.
 
@@ -389,10 +427,55 @@ class DisputeDetailResponse(CaseSummaryResponse):
     #: answer.
     investigations: list[InvestigationResponse] = Field(default_factory=list)
     reviews: list[ReviewResponse] = Field(default_factory=list)
+    #: Every recorded closing verdict, newest last. Present so a reopened history
+    #: shows both the original decision and any later one, side by side with the
+    #: runs they judged.
+    decisions: list[DecisionResponse] = Field(default_factory=list)
 
 
 class CaseListResponse(_Model):
     items: list[CaseSummaryResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class AuditEventResponse(_Model):
+    """One entry in a case's audit trail.
+
+    ``event_type`` is sent as its string value, not an enum: the set is closed and
+    the frontend branches on the literal, and a schema-bound enum would force a
+    client update for a value the server already knows how to describe. The context
+    fields that an event may not carry -- the run, the actor, the entity version, a
+    correlation id -- are explicitly nullable rather than omitted, so "not recorded"
+    and "recorded as empty" stay distinguishable.
+
+    ``payload`` is passed through as stored. It is the event-specific detail and its
+    shape varies by ``event_type``; the server does not reinterpret it on the way
+    out, so what a reviewer sees is exactly what was written.
+    """
+
+    id: str
+    event_type: str
+    dispute_id: str
+    occurred_at: datetime
+    investigation_id: str | None = None
+    actor_id: str | None = None
+    actor_role: str | None = None
+    entity_version: int | None = None
+    correlation_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditHistoryResponse(_Model):
+    """A page of a case's audit trail, oldest-first.
+
+    The same envelope as :class:`CaseListResponse`, so a client that can page the
+    dispute list can page this too, and the ordering is the reverse of the list's:
+    a trail read backwards is a stack, not a story.
+    """
+
+    items: list[AuditEventResponse]
     total: int
     limit: int
     offset: int

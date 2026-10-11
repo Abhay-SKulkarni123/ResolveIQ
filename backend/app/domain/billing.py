@@ -66,6 +66,7 @@ already fix them: rounding happens once at the line boundary
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, DecimalException
@@ -133,6 +134,24 @@ def _require_non_negative(value: Decimal, field_name: str) -> Decimal:
     if value < 0:
         raise BillingDataError(f"{field_name} must not be negative, got {value}")
     return value
+
+
+def _duplicate_metric_keys(lines: Sequence[InvoiceLine]) -> list[str]:
+    """Return the metric keys charged more than once, in sorted order.
+
+    A metric is identified by its key, so two lines with the same key describe the
+    same charge twice. Evidence collection keys a bundle by that metric and would
+    collapse the pair into a single item, while the engine still sums both lines:
+    the recorded total and the evidence would then disagree by the value of the
+    duplicated line. Rejecting the shape here keeps that from happening silently.
+    """
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for line in lines:
+        if line.metric_key in seen:
+            duplicates.add(line.metric_key)
+        seen.add(line.metric_key)
+    return sorted(duplicates)
 
 
 class LineType(str, Enum):
@@ -446,6 +465,14 @@ class RecordedInvoice:
         if not isinstance(self.period, InvoicePeriod):
             raise BillingDataError("RecordedInvoice.period must be an InvoicePeriod")
         object.__setattr__(self, "lines", tuple(self.lines))
+        duplicates = _duplicate_metric_keys(self.lines)
+        if duplicates:
+            raise BillingDataError(
+                f"invoice {self.external_id} has more than one line for "
+                + ", ".join(duplicates)
+                + "; a metric is identified by its key, so a repeated line would be "
+                "collapsed to one evidence item while still being summed"
+            )
         currency = Money.zero(self.currency).currency
         object.__setattr__(self, "currency", currency)
         if self.stated_total.currency != currency:

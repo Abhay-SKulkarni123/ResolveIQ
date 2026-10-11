@@ -17,6 +17,7 @@ untrusted text reaches no decision point can.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -492,3 +493,67 @@ class TestTheMockItself:
                     allowed_evidence_keys=evidence.allowed_keys,
                 )
             )
+
+
+class TestObservability:
+    """What the AI-observability log says, and what it must never say.
+
+    The run records enough to answer "which provider, model and prompt produced
+    this, how long did it take and how did it end" without ever writing the prompt
+    or the model's raw output to the log.
+    """
+
+    def _events(self, caplog, name: str) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if getattr(r, "event", None) == name]
+
+    def test_a_successful_run_logs_the_invocation_and_the_outcome(self, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="app.services.investigation")
+
+        investigate(inputs(), MockLlmProvider())
+
+        invoked = self._events(caplog, "ai.provider.invoked")
+        succeeded = self._events(caplog, "ai.provider.succeeded")
+        assert len(invoked) == 1
+        assert len(succeeded) == 1
+        fields = succeeded[0].fields
+        assert fields["provider"] == "mock"
+        assert fields["model"] == "mock-deterministic-v1"
+        assert fields["prompt_version"] == "prompt-v1"
+        assert fields["outcome"] == "ok"
+        assert isinstance(fields["duration_ms"], float)
+
+    def test_evidence_collection_is_logged_with_its_fingerprint(self, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="app.services.investigation")
+
+        result = investigate(inputs(), MockLlmProvider())
+
+        collected = self._events(caplog, "investigation.evidence.collected")
+        assert collected
+        assert collected[0].fields["evidence_fingerprint"] == result.evidence.fingerprint
+
+    def test_a_provider_failure_is_logged_with_its_safe_category(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger="app.services.investigation")
+
+        investigate(inputs(), MockLlmProvider(fail_with=LlmTimeoutError))
+
+        failed = self._events(caplog, "ai.provider.failed")
+        assert failed
+        assert failed[0].fields["error_category"] == "LlmTimeoutError"
+        assert failed[0].fields["outcome"] == InvestigationStatus.DEGRADED.value
+
+    def test_the_raw_model_response_never_reaches_the_log(self, caplog) -> None:
+        """A format error carries the offending text; the log must not copy it."""
+        caplog.set_level(logging.INFO, logger="app.services.investigation")
+
+        investigate(inputs(), MockLlmProvider(corrupt_response=True))
+
+        assert "amount" not in caplog.text
+        assert "response began" not in caplog.text
+        assert '"code": "X"' not in caplog.text
+
+    def test_the_dispute_text_never_reaches_the_log(self, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="app.services.investigation")
+
+        investigate(inputs(dispute_text="CARD-4111-1111-1111-1111 was double charged"), MockLlmProvider())
+
+        assert "4111" not in caplog.text

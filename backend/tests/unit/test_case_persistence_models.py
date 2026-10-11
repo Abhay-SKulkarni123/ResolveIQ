@@ -1,13 +1,19 @@
-"""Phase 4 persistence: the nine case tables and their agreement with the migration.
+"""Phase 4 persistence: the ten case tables and their agreement with the migrations.
 
 ``test_persistence_models.py`` covers the Phase 1-2 source tables. This file covers
 what Phase 4 added, and asserts the two properties that only fail once both the
-models and the migration exist:
+models and the migrations exist:
 
 * the ORM metadata is **complete**, so Alembic autogenerate does not propose
   dropping the tables it cannot see, and
-* the migration says the **same thing** as the metadata, so ``alembic upgrade``
+* the migrations say the **same thing** as the metadata, so ``alembic upgrade``
   produces the schema the application expects.
+
+The Phase 4 tables arrived in two migrations: 0002 brought the dispute, evidence,
+investigation and review tables, and 0003 added ``dispute_decisions`` (the closing
+verdict). Migration 0004 adds no table, only an optional ``idempotency_key`` column
+to four of them, so the schema tests read all three together and "the migration"
+below means the shared work of 0002, 0003 and 0004.
 
 Both are checked without a database. Whether PostgreSQL *accepts* the result is
 ``tests/integration/test_migrations.py``'s job, and that file skips when no server is
@@ -38,17 +44,24 @@ from app.adapters.persistence.case_models import (
 from app.domain.cases import (
     CaseSeverity,
     CaseStatus,
+    DecisionKind,
     InvestigationRunStatus,
     ReviewActionKind,
     ReviewTargetType,
 )
 
-MIGRATION = (
-    Path(__file__).resolve().parents[2]
-    / "migrations"
-    / "versions"
-    / "0002_dispute_cases.py"
-)
+_VERSIONS = Path(__file__).resolve().parents[2] / "migrations" / "versions"
+
+MIGRATION = _VERSIONS / "0002_dispute_cases.py"
+DECISION_MIGRATION = _VERSIONS / "0003_dispute_decisions.py"
+IDEMPOTENCY_MIGRATION = _VERSIONS / "0004_idempotency_keys.py"
+
+#: The Phase 4 migrations as one source. 0002 and 0003 are a single schema change
+#: split because the decision table deferred the FK-sortable question until after
+#: its reference tables existed; 0004 adds the idempotency columns to four of those
+#: tables with ``ALTER TABLE``. The tests compare against their combined text so a
+#: column loss in any surface shows up here.
+PHASE4_MIGRATION_FILES = (MIGRATION, DECISION_MIGRATION, IDEMPOTENCY_MIGRATION)
 
 PHASE4_TABLES = {
     "disputes",
@@ -60,6 +73,7 @@ PHASE4_TABLES = {
     "investigation_hypotheses",
     "investigation_resolution_options",
     "finding_reviews",
+    "dispute_decisions",
 }
 
 #: Every monetary column Phase 4 added, per table. Listed explicitly rather than
@@ -81,7 +95,7 @@ PHASE4_MONEY_COLUMNS = {
 
 @pytest.fixture(scope="module")
 def migration_source() -> str:
-    return MIGRATION.read_text(encoding="utf-8")
+    return "\n".join(path.read_text(encoding="utf-8") for path in PHASE4_MIGRATION_FILES)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +201,7 @@ def test_fingerprint_columns_are_varchar_71() -> None:
         ("investigations", "evidence_fingerprint"),
         ("dispute_evidence_items", "content_hash"),
         ("finding_reviews", "evidence_fingerprint_seen"),
+        ("dispute_decisions", "evidence_fingerprint_seen"),
     ):
         column = Base.metadata.tables[table_name].columns[column_name]
         assert column.type.length == 71, f"{table_name}.{column_name}"
@@ -277,25 +292,42 @@ def test_uniqueness_rules_the_domain_relies_on(table_name: str, expected: tuple[
     assert expected in unique, f"{table_name}: {sorted(unique)}"
 
 
-def test_finding_reviews_carry_no_uniqueness_constraint_yet() -> None:
-    """A known gap, pinned so it cannot be forgotten.
+def test_finding_reviews_carry_the_idempotency_uniqueness_constraint() -> None:
+    """The gap this test used to pin is now closed.
 
-    ``save`` refuses to overwrite an existing review row, but nothing stops two
-    *identical* reviews being stored, and a double-submitted POST produces exactly
-    that: two rows, same actor, same target, same rationale. The fix belongs to the
-    idempotency phase (SYSTEM_DESIGN §9.3), which brings an ``Idempotency-Key`` and
-    a uniqueness rule together -- adding a content hash here would be inventing that
-    design without the key, and would reject two legitimate identical annotations
-    from the same reviewer later.
-
-    Until then the duplicate is possible and this test says so out loud.
+    It previously asserted that ``finding_reviews`` had *no* uniqueness rule, so a
+    double-submitted POST could store two identical annotations. The idempotency
+    phase (SYSTEM_DESIGN §9.3) is what it was waiting for: ``idempotency_key`` and
+    its unique rule arrived together, so a retried request replays the first
+    annotation instead of inserting a twin. The rule is on the key alone and the
+    column is nullable, so two keyless annotations still coexist -- only real keys
+    collide, and ``NULL`` never compares equal under a SQL unique constraint.
     """
     unique = {
         tuple(column.name for column in constraint.columns)
         for constraint in Base.metadata.tables["finding_reviews"].constraints
         if isinstance(constraint, UniqueConstraint)
     }
-    assert unique == set()
+    assert ("idempotency_key",) in unique
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    ["disputes", "investigations", "finding_reviews", "dispute_decisions"],
+)
+def test_each_written_table_uniquely_constrains_its_idempotency_key(table_name: str) -> None:
+    """One key, one row, on every table a client writes through the case API.
+
+    The service checks the key before writing, but two deliveries racing past that
+    check both reach the insert; the unique constraint is what makes the loser fail
+    instead of storing a twin.
+    """
+    unique = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in Base.metadata.tables[table_name].constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("idempotency_key",) in unique, f"{table_name}: {sorted(unique)}"
 
 
 def test_investigation_version_is_unique_per_dispute() -> None:
@@ -487,10 +519,13 @@ def test_migration_drops_the_phase4_tables_on_downgrade(migration_source: str) -
 
 @pytest.mark.parametrize("table_name", sorted(PHASE4_TABLES))
 def test_migration_columns_match_the_orm(table_name: str, migration_source: str) -> None:
-    """Every ORM column appears in the migration's ``create_table`` for that table.
+    """Every ORM column appears in the migrations for that table.
 
-    A column added to a model but not to the migration fails at runtime, on the
-    first write that uses it, in whichever environment is furthest from the author.
+    A column can arrive two ways: declared in the ``create_table`` of 0002/0003, or
+    added later with ``op.add_column`` (0004's idempotency keys). Both are collected,
+    because a column the ORM knows and the migrations do not is one that fails at
+    runtime on the first write that uses it -- in whichever environment is furthest
+    from the author.
     """
     body = re.search(
         rf'op\.create_table\(\s*"{table_name}"(.*?)\n    \)',
@@ -499,12 +534,18 @@ def test_migration_columns_match_the_orm(table_name: str, migration_source: str)
     )
     assert body is not None, table_name
     migration_columns = set(re.findall(r'sa\.Column\(\s*"([a-z0-9_]+)"', body.group(1)))
+    migration_columns |= set(
+        re.findall(
+            rf'op\.add_column\(\s*(?:"{table_name}"|{table_name})\s*,\s*sa\.Column\(\s*"([a-z0-9_]+)"',
+            migration_source,
+        )
+    )
     orm_columns = {column.name for column in Base.metadata.tables[table_name].columns}
     assert orm_columns == migration_columns, table_name
 
 
-def _declared_checks(path: Path) -> list[tuple[str, str]]:
-    """Every ``CheckConstraint(sql, name=...)`` in a Python source file, by name.
+def _declared_checks(source: str, label: str) -> list[tuple[str, str]]:
+    """Every ``CheckConstraint(sql, name=...)`` in a Python source string, by name.
 
     Parsed with ``ast`` rather than scraped with a regular expression. The SQL is a
     mix of ``'`` and ``"`` quoting and is often written as several implicitly
@@ -515,11 +556,14 @@ def _declared_checks(path: Path) -> list[tuple[str, str]]:
     passed while the two were free to differ. ``ast`` sees the value the interpreter
     would, and adjacent string literals arrive already joined.
 
+    ``label`` names the source in failure messages (``"case_models.py"`` or the
+    combined Phase 4 migrations).
+
     The call shape is ``CheckConstraint(sql, name=...)`` -- one positional argument
     and a keyword ``name`` -- and that is asserted first, so a future edit that
     changes it fails loudly instead of quietly emptying the comparison.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = ast.parse(source)
     # Resolve the module-level names so an f-string that interpolates one still has a
     # static value: the status and action CHECKs are written as
     # ``f"status IN ({_CASE_STATUSES})"`` so that adding a state to the domain enum
@@ -555,9 +599,9 @@ def _declared_checks(path: Path) -> list[tuple[str, str]]:
         func = node.func
         if getattr(func, "attr", getattr(func, "id", "")) != "CheckConstraint":
             continue
-        assert len(node.args) == 1, f"unexpected CheckConstraint call shape in {path.name}"
+        assert len(node.args) == 1, f"unexpected CheckConstraint call shape in {label}"
         keywords = {keyword.arg for keyword in node.keywords}
-        assert "name" in keywords, f"unnamed CheckConstraint in {path.name}"
+        assert "name" in keywords, f"unnamed CheckConstraint in {label}"
         sql = _static_string(node.args[0], module_namespace)
         try:
             name = ast.literal_eval(
@@ -579,9 +623,9 @@ def _declared_checks(path: Path) -> list[tuple[str, str]]:
     return sorted(found)
 
 
-def _count_check_constraints(path: Path) -> int:
-    """How many ``CheckConstraint`` calls the file contains, read or not."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+def _count_check_constraints(source: str) -> int:
+    """How many ``CheckConstraint`` calls the source contains, read or not."""
+    tree = ast.parse(source)
     return sum(
         1
         for node in ast.walk(tree)
@@ -646,29 +690,24 @@ def test_migration_check_constraints_match_the_orm(migration_source: str) -> Non
     domain refuses, which surfaces as a constraint violation on an INSERT rather
     than as a validation error on the request.
     """
-    orm = _declared_checks(
+    orm_source = (
         Path(__file__).resolve().parents[2]
         / "app"
         / "adapters"
         / "persistence"
         / "case_models.py"
-    )
-    migration = _declared_checks(MIGRATION)
+    ).read_text(encoding="utf-8")
+    orm = _declared_checks(orm_source, "case_models.py")
+    migration = _declared_checks(migration_source, "phase 4 migrations")
 
     # Guard against the vacuous comparison this extractor once suffered, when it
     # assumed the wrong argument order and returned {} for both files. Every
-    # CheckConstraint call in each file must be accounted for; if the extractor
+    # CheckConstraint call in each source must be accounted for; if the extractor
     # cannot read one, this fails rather than quietly narrowing the comparison.
-    orm_calls = _count_check_constraints(
-        Path(__file__).resolve().parents[2]
-        / "app"
-        / "adapters"
-        / "persistence"
-        / "case_models.py"
-    )
-    migration_calls = _count_check_constraints(MIGRATION)
-    assert orm_calls == 29, f"the ORM declares {orm_calls} check constraints"
-    assert migration_calls == 29, f"the migration declares {migration_calls}"
+    orm_calls = _count_check_constraints(orm_source)
+    migration_calls = _count_check_constraints(migration_source)
+    assert orm_calls == 33, f"the ORM declares {orm_calls} check constraints"
+    assert migration_calls == 33, f"the migrations declare {migration_calls}"
     assert len(orm) == orm_calls, f"extractor read {len(orm)} of {orm_calls} ORM constraints"
     assert len(migration) == migration_calls, (
         f"extractor read {len(migration)} of {migration_calls} migration constraints"
@@ -687,6 +726,7 @@ def test_migration_check_constraints_match_the_orm(migration_source: str) -> Non
         ("investigations", "status", InvestigationRunStatus),
         ("finding_reviews", "action", ReviewActionKind),
         ("finding_reviews", "target_type", ReviewTargetType),
+        ("dispute_decisions", "decision", DecisionKind),
     ],
 )
 def test_enum_backed_checks_list_every_domain_member(
@@ -698,7 +738,7 @@ def test_enum_backed_checks_list_every_domain_member(
     a state to the enum without widening the CHECK produces a schema that accepts
     nothing new, and widening the CHECK alone accepts values no code can produce.
 
-    These five columns get their CHECK text from a hand-written ``_CASE_STATUSES``-
+    These six columns get their CHECK text from a hand-written ``_CASE_STATUSES``-
     style constant rather than from the enum, precisely because a CHECK cannot call
     Python. That makes the constant the place the two can drift apart, so it is
     asserted rather than trusted.

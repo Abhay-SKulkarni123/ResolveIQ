@@ -8,6 +8,8 @@
  *   - a self-declared identity is *said* to be self-declared;
  *   - a stale run is visible and cannot be reviewed;
  *   - amounts arrive and render as the exact text the API sent;
+ *   - a case awaiting review offers a closing verdict only after a review exists,
+ *     and only to a reviewer;
  *   - there is no control that moves money.
  *
  * The last one is asserted by looking for the absence of a button. A test that read the
@@ -156,6 +158,7 @@ function caseDetail(overrides: Partial<CaseDetail> = {}): CaseDetail {
     current_investigation: investigation(),
     investigations: [investigation()],
     reviews: [],
+    decisions: [],
     ...overrides,
   }
 }
@@ -200,6 +203,7 @@ function stubApi(overrides: Partial<Record<keyof typeof api, unknown>> = {}) {
       .fn()
       .mockResolvedValue({ items: [caseSummary()], total: 1, limit: 50, offset: 0 }),
     getCase: vi.fn().mockResolvedValue(caseDetail()),
+    getAudit: vi.fn().mockResolvedValue({ items: [], total: 0, limit: 100, offset: 0 }),
     investigate: vi.fn().mockResolvedValue(investigation()),
     recordReview: vi.fn().mockResolvedValue({
       id: 'review-1',
@@ -214,6 +218,16 @@ function stubApi(overrides: Partial<Record<keyof typeof api, unknown>> = {}) {
       created_at: '2026-03-31T12:00:00Z',
     }),
     reopen: vi.fn().mockResolvedValue(caseDetail()),
+    decide: vi.fn().mockResolvedValue({
+      id: 'decision-1',
+      investigation_id: 'run-1',
+      decision: 'RESOLVED',
+      actor_id: 'dev-reviewer',
+      actor_role: 'reviewer',
+      rationale: 'matches the export',
+      evidence_fingerprint_seen: 'sha256:' + 'a'.repeat(64),
+      created_at: '2026-03-31T12:00:00Z',
+    }),
     attachEvidence: vi.fn().mockResolvedValue(caseDetail()),
   }
   for (const [name, value] of Object.entries({ ...defaults, ...overrides })) {
@@ -481,6 +495,87 @@ describe('the case detail view', () => {
 
     expect(await screen.findByText(/needs human approval/i)).toBeInTheDocument()
     expect(screen.getByText(/does not carry out this step/i)).toBeInTheDocument()
+  })
+
+  it('waits for a review before offering to close the case', async () => {
+    stubApi()
+    render(<App />)
+
+    await userEvent.click(await screen.findByRole('button', { name: /DSC-000123/ }))
+
+    expect(await screen.findByText('Close the case')).toBeInTheDocument()
+    expect(screen.getByText(/nothing has been reviewed/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Resolve' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeDisabled()
+  })
+
+  it('records a resolve verdict against the newest run', async () => {
+    const review = {
+      id: 'review-1',
+      investigation_id: 'run-1',
+      target_type: 'FINDING' as const,
+      target_id: 'finding-1',
+      action: 'ACCEPT' as const,
+      actor_id: 'dev-reviewer',
+      actor_role: 'reviewer',
+      rationale: 'ok',
+      evidence_fingerprint_seen: 'sha256:' + 'a'.repeat(64),
+      is_against_current_evidence: true,
+      created_at: '2026-03-31T12:00:00Z',
+    }
+    stubApi({ getCase: vi.fn().mockResolvedValue(caseDetail({ reviews: [review] })) })
+    render(<App />)
+
+    await userEvent.click(await screen.findByRole('button', { name: /DSC-000123/ }))
+    await userEvent.type(await screen.findByLabelText('Decision rationale'), 'billing error confirmed')
+    await userEvent.click(await screen.findByRole('button', { name: 'Resolve' }))
+
+    await waitFor(() =>
+      expect(api.decide).toHaveBeenCalledWith('case-1', 'RESOLVED', 'billing error confirmed'),
+    )
+  })
+
+  it('shows recorded decisions on a reopened case', async () => {
+    const decision = {
+      id: 'decision-1',
+      investigation_id: 'run-1',
+      decision: 'RESOLVED' as const,
+      actor_id: 'dev-reviewer',
+      actor_role: 'reviewer',
+      rationale: 'overbilling on the export',
+      evidence_fingerprint_seen: 'sha256:' + 'a'.repeat(64),
+      created_at: '2026-03-31T12:00:00Z',
+    }
+    stubApi({
+      getCase: vi.fn().mockResolvedValue(
+        caseDetail({ status: 'REOPENED', decisions: [decision] }),
+      ),
+    })
+    render(<App />)
+
+    await userEvent.click(await screen.findByRole('button', { name: /DSC-000123/ }))
+
+    expect(await screen.findByText('Closing decisions')).toBeInTheDocument()
+    expect(screen.getByText(/overbilling on the export/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Resolve' })).not.toBeInTheDocument()
+  })
+
+  it('does not offer the verdict to a caller who is not a reviewer', async () => {
+    stubApi({
+      capabilities: vi
+        .fn()
+        .mockResolvedValue({
+          ...CAPABILITIES,
+          identity: { ...CAPABILITIES.identity, actor_role: 'analyst' },
+        }),
+    })
+    render(<App />)
+
+    await userEvent.click(await screen.findByRole('button', { name: /DSC-000123/ }))
+
+    expect(await screen.findByText(/recalculation/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Resolve' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument()
   })
 })
 

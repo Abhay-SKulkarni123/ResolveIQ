@@ -349,6 +349,60 @@ class TestRecordedInvoice:
                 stated_total=usd("50.00"),
             )
 
+    def test_a_metric_charged_twice_is_refused(self) -> None:
+        """Two lines for one metric are silently double-counted, so the invoice is refused.
+
+        Evidence keys a bundle by ``metric_key`` and collapses the pair into one item while
+        the engine still sums both lines, so the recorded total and the evidence would
+        disagree by the value of the repeated line. Refusing here is the only point at which
+        the caller learns which key was repeated.
+        """
+        with pytest.raises(BillingDataError, match="api_calls"):
+            RecordedInvoice(
+                external_id="INV-1",
+                period=period(),
+                currency="USD",
+                lines=(
+                    usage_line(recorded_amount=usd("50.00")),
+                    usage_line(recorded_amount=usd("50.00")),
+                ),
+                stated_total=usd("100.00"),
+            )
+
+    def test_a_metric_repeated_across_line_types_is_still_refused(self) -> None:
+        """The key identifies the metric, not the pair; a FIXED and a USAGE line collide.
+
+        A fixed platform fee recorded against the same metric as metered usage is exactly the
+        shape that would collapse in the evidence, so line type cannot be part of the
+        identity used to detect the repeat.
+        """
+        with pytest.raises(BillingDataError, match="api_calls"):
+            RecordedInvoice(
+                external_id="INV-1",
+                period=period(),
+                currency="USD",
+                lines=(
+                    usage_line(recorded_amount=usd("50.00")),
+                    usage_line(line_type=LineType.FIXED, recorded_amount=usd("20.00")),
+                ),
+                stated_total=usd("70.00"),
+            )
+
+    def test_distinct_metrics_are_kept(self) -> None:
+        """The guard must not refuse an ordinary invoice that charges several metrics."""
+        invoice = RecordedInvoice(
+            external_id="INV-1",
+            period=period(),
+            currency="USD",
+            lines=(
+                usage_line(metric_key="api_calls", recorded_amount=usd("50.00")),
+                usage_line(metric_key="storage_gb", recorded_amount=usd("20.00")),
+            ),
+            stated_total=usd("70.00"),
+        )
+
+        assert {line.metric_key for line in invoice.lines} == {"api_calls", "storage_gb"}
+
 
 class TestPayment:
     """Money received, and how much of it reached this invoice."""

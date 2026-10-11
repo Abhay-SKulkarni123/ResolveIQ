@@ -31,6 +31,7 @@ from sqlalchemy.exc import ArgumentError, DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings, get_settings
+from app.logging_config import log_event
 
 __all__ = [
     "CONNECT_TIMEOUT_SECONDS",
@@ -179,8 +180,35 @@ def get_engine(settings: Settings | None = None) -> Engine:
     if _engine is None:
         active = settings or get_settings()
         _engine = create_engine_for_url(active.database_url, echo=active.app_env == "development")
-        logger.info("database engine created for %s", redact_database_url(active.database_url))
+        target = _target_fields(active.database_url)
+        log_event(
+            logger,
+            logging.INFO,
+            "db.engine.created",
+            backend=target["backend"],
+            host=target["host"],
+            database=target["database"],
+        )
     return _engine
+
+
+def _target_fields(url: str) -> dict[str, str]:
+    """The non-secret coordinates of a database URL, for a log line.
+
+    Deliberately not the URL itself: the URL embeds the password, and ``redact``
+    is one bug away from printing it whole. The backend, host and database name are
+    what a log reader needs to tell one environment from another, and none of them
+    is a credential.
+    """
+    try:
+        parsed = make_url(url)
+    except ArgumentError:
+        return {"backend": "", "host": "", "database": ""}
+    return {
+        "backend": parsed.get_backend_name(),
+        "host": parsed.host or "",
+        "database": parsed.database or "",
+    }
 
 
 def get_sessionmaker(engine: Engine | None = None) -> sessionmaker[Session]:
