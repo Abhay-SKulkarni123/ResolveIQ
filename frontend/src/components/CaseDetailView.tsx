@@ -8,14 +8,17 @@
  *   calculation -> the figures, with an explicit provisional marker
  *   evidence    -> every natural key, so a citation can be checked by eye
  *   findings    -> each with its citations and its reviews
- *   history     -> every run, including superseded ones
+ *   close       -> the verdict, once a review exists and only for a reviewer
+ *   history     -> every run, including superseded ones, and every closed verdict
+ *   audit       -> the whole sequence, append-only
  *
- * Superseded runs are shown, not hidden. "Compare with what we saw then" is the reason
- * the backend keeps them, and a UI that only ever renders the newest run makes the
- * history pointless.
+ * Three kinds of claim are kept visually distinct, because conflating them is how a
+ * reviewer ends up treating a model's guess as a fact: the deterministic engine's
+ * figures, the model's findings and hypotheses, and the reviewers' annotations. The
+ * review workbench never renders a control that moves money.
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import { ApiError, api } from '../api/client'
 import type {
@@ -31,16 +34,32 @@ import type {
   ReviewAction,
   ReviewResponse,
 } from '../api/types'
+import { cn } from './cn'
+import { IconArrowLeft, IconLock } from './icons'
+import { formatMoneyDetail } from './money'
 import {
   Amount,
   Difference,
   EmptyState,
   ErrorPanel,
   Fingerprint,
+  SeverityBadge,
   StaleBadge,
   StatusBadge,
 } from './primitives'
-import { formatMoneyDetail } from './money'
+import {
+  Alert,
+  Badge,
+  Button,
+  Disclosure,
+  Field,
+  Panel,
+  PanelBody,
+  PanelHeader,
+  Select,
+  Skeleton,
+  TextInput,
+} from './ui'
 
 const REVIEW_ACTIONS: { value: ReviewAction; label: string }[] = [
   { value: 'ACCEPT', label: 'Accept' },
@@ -52,10 +71,12 @@ const REVIEW_ACTIONS: { value: ReviewAction; label: string }[] = [
 export function CaseDetailView({
   caseId,
   actorRole,
+  onBack,
   onChanged,
 }: {
   caseId: string
   actorRole: string
+  onBack: () => void
   onChanged?: () => void
 }) {
   const [detail, setDetail] = useState<CaseDetail | null>(null)
@@ -67,9 +88,9 @@ export function CaseDetailView({
   const load = useCallback(async () => {
     try {
       // The trail is a separate read from the detail, so it is fetched alongside it
-      // rather than embedded in it: a case with a long history does not weigh down
-      // the response every viewer loads, and a failure to read the audit does not
-      // stop the case itself from rendering.
+      // rather than embedded in it: a case with a long history does not weigh down the
+      // response every viewer loads, and a failed audit read does not stop the case
+      // itself from rendering.
       const [nextDetail, nextAudit] = await Promise.all([
         api.getCase(caseId),
         api.getAudit(caseId, { limit: 100 }),
@@ -103,10 +124,15 @@ export function CaseDetailView({
   }
 
   if (error && !detail) {
-    return <ErrorPanel title="Could not load this case" message={error.message} code={error.code} />
+    return (
+      <div className="space-y-4">
+        <Breadcrumb externalId={null} onBack={onBack} />
+        <ErrorPanel title="Could not load this case" message={error.message} code={error.code} />
+      </div>
+    )
   }
   if (!detail) {
-    return <EmptyState>Loading...</EmptyState>
+    return <DetailSkeleton />
   }
 
   // The backend names the live run; it does not make the client re-derive it. The old
@@ -114,44 +140,24 @@ export function CaseDetailView({
   // always fell through to "last run wins" and silently mislabelled reopened cases.
   const current = detail.current_investigation
   const latest = current ?? detail.investigations[detail.investigations.length - 1]
+  const reviewedOnLatest = Boolean(
+    latest && detail.reviews.some((review) => review.investigation_id === latest.id),
+  )
+  const isReviewer = actorRole === 'reviewer'
+  const canClose = detail.status === 'AWAITING_REVIEW' && isReviewer
 
   return (
     <div className="space-y-6">
-      <header className="space-y-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="text-lg font-semibold">{detail.external_id}</h1>
-          <StatusBadge status={detail.status} />
-          <StaleBadge isStale={detail.is_stale} />
-        </div>
-        <p className="text-sm text-ink-muted">{detail.description}</p>
-        <dl className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-ink-muted">
-          <div className="flex gap-1">
-            <dt>Invoice</dt>
-            <dd className="font-mono">{detail.invoice_external_id}</dd>
-          </div>
-          {detail.contract_external_id && (
-            <div className="flex gap-1">
-              <dt>Contract</dt>
-              <dd className="font-mono">{detail.contract_external_id}</dd>
-            </div>
-          )}
-          <div className="flex gap-1">
-            <dt>Evidence</dt>
-            <dd>
-              <Fingerprint value={detail.evidence_fingerprint} label="evidence fingerprint" />
-            </dd>
-          </div>
-          <div className="flex gap-1">
-            <dt>Version</dt>
-            <dd className="font-mono">{detail.version}</dd>
-          </div>
-        </dl>
-      </header>
+      <Breadcrumb externalId={detail.external_id} onBack={onBack} />
+
+      <CaseHeader detail={detail} />
+
+      <NextStep detail={detail} hasRun={latest !== undefined} reviewed={reviewedOnLatest} isReviewer={isReviewer} />
 
       {notice && (
-        <p role="status" className="rounded border border-line bg-surface px-3 py-2 text-xs text-ink-muted">
+        <Alert tone="success" live>
           {notice}
-        </p>
+        </Alert>
       )}
       {error && (
         <ErrorPanel
@@ -167,49 +173,51 @@ export function CaseDetailView({
         />
       )}
 
-      <section className="flex flex-wrap gap-2">
-        <ActionButton
-          busy={busy}
+      <section className="flex flex-wrap items-center gap-2">
+        <Button
+          variant={latest === undefined || detail.is_stale ? 'primary' : 'secondary'}
+          loading={busy}
           onClick={() => run(() => api.investigate(detail.id), 'Investigation recorded.')}
-          label="Run investigation"
-        />
-        <ReopenButton
+        >
+          Run investigation
+        </Button>
+        <ReopenControl
           busy={busy}
-          disabled={detail.status !== 'RESOLVED' && detail.status !== 'REJECTED'}
+          closed={detail.status === 'RESOLVED' || detail.status === 'REJECTED'}
           onReopen={(reason) =>
             run(() => api.reopen(detail.id, reason), 'Case reopened. It needs a new run.')
           }
         />
-        {detail.status === 'AWAITING_REVIEW' && actorRole === 'reviewer' && (
-          <DecidePanel
-            busy={busy}
-            reviewed={Boolean(latest && detail.reviews.some((review) => review.investigation_id === latest.id))}
-            onDecide={(decision, rationale) =>
-              run(
-                () => api.decide(detail.id, decision, rationale),
-                decision === 'RESOLVED' ? 'Case resolved.' : 'Case rejected.',
-              )
-            }
-          />
-        )}
-        {/* No approve, no adjust, no execute. Those arrive with the Phase 8 guards. */}
+        {/* No approve, no adjust, no execute. Those arrive with the later guards. */}
       </section>
 
       {detail.is_stale && latest && (
-        <div className="rounded border border-warn-border bg-warn-bg px-4 py-3 text-sm text-warn-text">
-          <p className="font-medium">The newest run no longer describes this case.</p>
-          <p className="mt-1">
-            Evidence was attached after version {latest.version} ran, so its findings and
-            figures describe records that are no longer on the dispute. Re-run before
-            reviewing.
-          </p>
-        </div>
+        <Alert tone="warning" title="The newest run no longer describes this case.">
+          Evidence was attached after version {latest.version} ran, so its findings and figures
+          describe records that are no longer on the dispute. Re-run before reviewing.
+        </Alert>
       )}
 
       {latest ? (
         <RunView caseId={detail.id} run={latest} onReview={run} busy={busy} />
       ) : (
-        <EmptyState>Not investigated yet.</EmptyState>
+        <EmptyState>
+          <span className="font-medium text-ink">Not investigated yet.</span> Run an investigation
+          to price the invoice and surface findings.
+        </EmptyState>
+      )}
+
+      {canClose && latest && (
+        <DecidePanel
+          busy={busy}
+          reviewed={reviewedOnLatest}
+          onDecide={(decision, rationale) =>
+            run(
+              () => api.decide(detail.id, decision, rationale),
+              decision === 'RESOLVED' ? 'Case resolved.' : 'Case rejected.',
+            )
+          }
+        />
       )}
 
       <EvidencePanel detail={detail} />
@@ -220,62 +228,196 @@ export function CaseDetailView({
   )
 }
 
-function ActionButton({
-  onClick,
-  busy,
-  label,
-  disabled = false,
-}: {
-  onClick: () => void
-  busy: boolean
-  label: string
-  disabled?: boolean
-}) {
+/* -------------------------------------------------------------------------- */
+/* Header and framing                                                         */
+/* -------------------------------------------------------------------------- */
+
+function Breadcrumb({ externalId, onBack }: { externalId: string | null; onBack: () => void }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={busy || disabled}
-      className="rounded border border-line bg-surface px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
-    >
-      {label}
-    </button>
+    <nav aria-label="Breadcrumb" className="flex items-center gap-2 text-xs">
+      <button
+        type="button"
+        onClick={onBack}
+        className="inline-flex items-center gap-1 rounded-md text-ink-muted transition-colors hover:text-ink"
+      >
+        <IconArrowLeft size={14} />
+        Disputes
+      </button>
+      {externalId && (
+        <>
+          <span className="text-ink-faint" aria-hidden="true">
+            /
+          </span>
+          <span className="font-mono text-ink-muted">{externalId}</span>
+        </>
+      )}
+    </nav>
   )
 }
 
-function ReopenButton({
+function CaseHeader({ detail }: { detail: CaseDetail }) {
+  return (
+    <header className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <h1 className="font-mono text-xl font-semibold tracking-tight text-ink">{detail.external_id}</h1>
+        <StatusBadge status={detail.status} />
+        <StaleBadge isStale={detail.is_stale} />
+        <SeverityBadge severity={detail.severity} />
+      </div>
+      <p className="max-w-3xl text-sm leading-relaxed text-ink-muted">{detail.description}</p>
+      <dl className="flex flex-wrap gap-x-6 gap-y-1.5 text-xs text-ink-muted">
+        <Meta label="Invoice" value={<span className="font-mono">{detail.invoice_external_id}</span>} />
+        {detail.contract_external_id && (
+          <Meta label="Contract" value={<span className="font-mono">{detail.contract_external_id}</span>} />
+        )}
+        <Meta label="Balance" value={<Amount value={detail.outstanding} currency={detail.currency} />} />
+        <Meta label="Findings" value={<span className="tabular-nums">{detail.finding_count}</span>} />
+        <Meta label="Version" value={<span className="tabular-nums">{detail.version}</span>} />
+        <Meta
+          label="Evidence"
+          value={<Fingerprint value={detail.evidence_fingerprint} label="evidence fingerprint" />}
+        />
+      </dl>
+    </header>
+  )
+}
+
+function Meta({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <dt className="text-ink-faint">{label}</dt>
+      <dd className="text-ink">{value}</dd>
+    </div>
+  )
+}
+
+/**
+ * The one sentence that says where the case is and what happens next.
+ *
+ * It is derived only from state the server sends -- status, staleness, whether the
+ * newest run has been reviewed, and the caller's role -- so it can never advise an
+ * action the backend would refuse.
+ */
+function NextStep({
+  detail,
+  hasRun,
+  reviewed,
+  isReviewer,
+}: {
+  detail: CaseDetail
+  hasRun: boolean
+  reviewed: boolean
+  isReviewer: boolean
+}) {
+  const step = describeNextStep(detail.status, detail.is_stale, hasRun, reviewed, isReviewer)
+  if (!step) return null
+  const tone = detail.is_stale ? 'warning' : step.tone
+  return (
+    <Alert tone={tone} title={step.title}>
+      {step.body}
+    </Alert>
+  )
+}
+
+function describeNextStep(
+  status: CaseDetail['status'],
+  isStale: boolean,
+  hasRun: boolean,
+  reviewed: boolean,
+  isReviewer: boolean,
+): { title: string; body: string; tone: 'info' | 'warning' | 'success' } | null {
+  if (isStale) {
+    return {
+      title: 'Re-run before reviewing',
+      body: 'New evidence was attached after the newest run, so its figures describe records that have changed. Start a fresh run to bring the case up to date.',
+      tone: 'warning',
+    }
+  }
+  switch (status) {
+    case 'OPEN':
+    case 'INVESTIGATING':
+      return hasRun
+        ? {
+            title: 'Review the findings',
+            body: 'A run is recorded. Check each finding against the evidence it cites, then close the case.',
+            tone: 'info',
+          }
+        : {
+            title: 'Run the investigation',
+            body: 'Nothing has been priced yet. A run applies the contract terms to the usage and reports what it finds.',
+            tone: 'info',
+          }
+    case 'REOPENED':
+      return {
+        title: 'This case was reopened',
+        body: 'Its earlier verdict still stands in the history, but the case needs a fresh run before it can be reviewed again.',
+        tone: 'info',
+      }
+    case 'AWAITING_REVIEW':
+      if (!isReviewer) {
+        return {
+          title: 'Awaiting a reviewer',
+          body: 'This case is ready to close. Recording the verdict is a reviewer action; you are viewing as an analyst.',
+          tone: 'info',
+        }
+      }
+      return reviewed
+        ? {
+            title: 'Ready to close',
+            body: 'The newest run has at least one recorded review. Record the verdict that closes the case when you are satisfied.',
+            tone: 'success',
+          }
+        : {
+            title: 'Review before closing',
+            body: 'Read each finding against its citations and record a decision on it. The verdict unlocks once the run has been reviewed.',
+            tone: 'info',
+          }
+    case 'RESOLVED':
+    case 'REJECTED':
+      return {
+        title: 'Case closed',
+        body: 'Its verdict is recorded below. If the picture changes, reopen the case with a reason and it will need a new run.',
+        tone: 'success',
+      }
+    default:
+      return null
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Actions                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function ReopenControl({
   onReopen,
   busy,
-  disabled,
+  closed,
 }: {
   onReopen: (reason: string) => void
   busy: boolean
-  disabled: boolean
+  closed: boolean
 }) {
   const [reason, setReason] = useState('')
-  if (disabled) {
+  if (!closed) {
     return (
-      <span className="rounded border border-dashed border-line px-3 py-1.5 text-xs text-ink-faint">
+      <span className="rounded-md border border-dashed border-line px-3 py-2 text-xs text-ink-faint">
         Reopen is available once the case is closed
       </span>
     )
   }
   return (
-    <span className="flex items-center gap-2">
-      <input
-        value={reason}
-        onChange={(event) => setReason(event.target.value)}
-        placeholder="Why is this being reopened?"
-        aria-label="Reason for reopening"
-        className="rounded border border-line px-2 py-1.5 text-sm"
-      />
-      <ActionButton
-        busy={busy}
-        disabled={reason.trim() === ''}
-        onClick={() => onReopen(reason)}
-        label="Reopen"
-      />
-    </span>
+    <div className="flex flex-wrap items-end gap-2">
+      <Field label="Reason for reopening" className="w-72">
+        <TextInput
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder="What changed?"
+        />
+      </Field>
+      <Button disabled={reason.trim() === '' || busy} onClick={() => onReopen(reason)}>
+        Reopen
+      </Button>
+    </div>
   )
 }
 
@@ -289,48 +431,56 @@ function DecidePanel({
   onDecide: (decision: DecisionKind, rationale: string) => void
 }) {
   const [rationale, setRationale] = useState('')
-  const invalid = busy || rationale.trim() === ''
+  const rationaleMissing = rationale.trim() === ''
   return (
-    <div className="rounded border border-line bg-surface px-3 py-2">
-      <p className="text-xs font-medium">Close the case</p>
-      {!reviewed && (
-        <p className="text-xs text-warn-text">
-          Nothing has been reviewed on the newest run yet. The backend will refuse a
-          verdict until it has.
-        </p>
-      )}
-      <span className="flex flex-wrap items-center gap-2">
-        <label className="sr-only" htmlFor="decision-rationale">
-          Decision rationale
-        </label>
-        <input
-          id="decision-rationale"
-          value={rationale}
-          onChange={(event) => setRationale(event.target.value)}
-          placeholder="Why this verdict?"
-          disabled={busy || !reviewed}
-          className="min-w-56 flex-1 rounded border border-line px-2 py-1.5 text-sm"
-        />
-        <button
-          type="button"
-          disabled={invalid || !reviewed}
-          onClick={() => onDecide('RESOLVED', rationale)}
-          className="rounded border border-line bg-surface px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+    <Panel>
+      <PanelHeader
+        title="Close the case"
+        description="The verdict is a lifecycle change. It moves no money."
+      />
+      <PanelBody className="space-y-3">
+        {!reviewed && (
+          <Alert tone="warning">
+            Nothing has been reviewed on the newest run yet. The backend will refuse a verdict until
+            it has.
+          </Alert>
+        )}
+        <Field
+          label="Decision rationale"
+          hint="Why this verdict is the right one. The verdict carries no other record of the reasoning."
         >
-          Resolve
-        </button>
-        <button
-          type="button"
-          disabled={invalid || !reviewed}
-          onClick={() => onDecide('REJECTED', rationale)}
-          className="rounded border border-line bg-surface px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          Reject
-        </button>
-      </span>
-    </div>
+          <TextInput
+            value={rationale}
+            onChange={(event) => setRationale(event.target.value)}
+            placeholder="e.g. the corrected usage matches the export"
+            disabled={busy || !reviewed}
+          />
+        </Field>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="primary"
+            disabled={busy || !reviewed || rationaleMissing}
+            loading={busy}
+            onClick={() => onDecide('RESOLVED', rationale)}
+          >
+            Resolve
+          </Button>
+          <Button
+            variant="danger"
+            disabled={busy || !reviewed || rationaleMissing}
+            onClick={() => onDecide('REJECTED', rationale)}
+          >
+            Reject
+          </Button>
+        </div>
+      </PanelBody>
+    </Panel>
   )
 }
+
+/* -------------------------------------------------------------------------- */
+/* A run                                                                      */
+/* -------------------------------------------------------------------------- */
 
 function RunView({
   caseId,
@@ -344,49 +494,55 @@ function RunView({
   busy: boolean
 }) {
   return (
-    <section className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2 border-b border-line pb-2 text-xs text-ink-muted">
-        <span>Version {run.version}</span>
-        <StaleBadge isStale={run.is_stale} />
-        <span>
-          Provider <span className="font-mono">{run.provider_name}</span>
-        </span>
-        <span>
-          Model <span className="font-mono">{run.model}</span>
-        </span>
-        <span>
-          Prompt <span className="font-mono">{run.prompt_version}</span>
-        </span>
-        <span>
-          Engine <span className="font-mono">{run.engine_version}</span>
-        </span>
-        <span>
-          Read <Fingerprint value={run.evidence_fingerprint} label="run fingerprint" />
-        </span>
-      </div>
+    <div className="space-y-6">
+      <Panel>
+        <PanelHeader title={`Run v${run.version}`} description={`Recorded ${run.created_at}`} actions={<StaleBadge isStale={run.is_stale} />} />
+        <PanelBody>
+          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-xs sm:grid-cols-3 lg:grid-cols-6">
+            <Meta label="Provider" value={<span className="font-mono">{run.provider_name}</span>} />
+            <Meta label="Model" value={<span className="font-mono">{run.model}</span>} />
+            <Meta label="Prompt" value={<span className="font-mono">{run.prompt_version}</span>} />
+            <Meta label="Engine" value={<span className="font-mono">{run.engine_version}</span>} />
+            <Meta label="Status" value={<span className="font-mono">{run.status}</span>} />
+            <Meta
+              label="Read"
+              value={<Fingerprint value={run.evidence_fingerprint} label="run fingerprint" />}
+            />
+          </dl>
+          <p className="mt-3 text-xs text-ink-faint">
+            The model reports findings; the engine computes the figures. They are not the same claim.
+          </p>
+        </PanelBody>
+      </Panel>
 
       {run.degradations.length > 0 && (
-        <div className="rounded border border-warn-border bg-warn-bg px-3 py-2 text-xs text-warn-text">
-          <p className="font-medium">This run is degraded.</p>
-          <ul className="mt-1 list-disc pl-4">
+        <Alert tone="warning" title="This run is degraded.">
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
             {run.degradations.map((degradation) => (
               <li key={degradation}>{degradation}</li>
             ))}
           </ul>
           <p className="mt-1">
-            Treat its conclusions as incomplete. Nothing here should be relied on without
-            checking.
+            Treat its conclusions as incomplete. Nothing here should be relied on without checking.
           </p>
-        </div>
+        </Alert>
       )}
 
       {run.calculation && <CalculationPanel calculation={run.calculation} />}
 
-      <p className="text-sm text-ink">{run.summary}</p>
+      <Panel>
+        <PanelHeader title="What the run concluded" />
+        <PanelBody>
+          <p className="text-sm leading-relaxed text-ink">{run.summary}</p>
+        </PanelBody>
+      </Panel>
 
       {run.findings.length > 0 && (
-        <div className="space-y-3">
-          <h2 className="text-sm font-semibold">Findings</h2>
+        <section className="space-y-3">
+          <SectionHeading
+            title="Findings"
+            description="Each finding is the model's claim, supported by the evidence keys it cites. A reviewer decides whether it holds."
+          />
           {run.findings.map((item) => (
             <FindingCard
               key={item.id}
@@ -398,29 +554,48 @@ function RunView({
               disabled={run.is_stale}
             />
           ))}
-        </div>
+        </section>
       )}
 
       {run.hypotheses.length > 0 && (
-        <div className="space-y-3">
-          <h2 className="text-sm font-semibold">Hypotheses</h2>
+        <section className="space-y-3">
+          <SectionHeading
+            title="Hypotheses"
+            description="Unconfirmed explanations the model offered. These are not established facts."
+          />
           {run.hypotheses.map((item) => (
             <HypothesisCard key={item.id} hypothesis={item} />
           ))}
-        </div>
+        </section>
       )}
 
       {run.resolution_options.length > 0 && (
-        <div className="space-y-3">
-          <h2 className="text-sm font-semibold">Suggested next steps</h2>
+        <section className="space-y-3">
+          <SectionHeading
+            title="Suggested next steps"
+            description="What the system suggests doing. It records the suggestion and carries nothing out."
+          />
           {run.resolution_options.map((item) => (
             <OptionCard key={item.id} option={item} />
           ))}
-        </div>
+        </section>
       )}
-    </section>
+    </div>
   )
 }
+
+function SectionHeading({ title, description }: { title: string; description: string }) {
+  return (
+    <div>
+      <h2 className="text-sm font-semibold text-ink">{title}</h2>
+      <p className="mt-0.5 max-w-2xl text-xs text-ink-muted">{description}</p>
+    </div>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Calculation                                                                */
+/* -------------------------------------------------------------------------- */
 
 function CalculationPanel({
   calculation,
@@ -428,47 +603,67 @@ function CalculationPanel({
   calculation: NonNullable<InvestigationResponse['calculation']>
 }) {
   return (
-    <div className="rounded border border-line bg-surface p-4">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-sm font-semibold">Recalculation</h2>
-        {calculation.is_provisional && (
-          <span className="rounded border border-warn-border bg-warn-bg px-2 py-0.5 text-xs text-warn-text">
-            Provisional
-          </span>
+    <Panel className="border-l-2 border-l-accent">
+      <PanelHeader
+        title="Recalculation"
+        description="Computed by the deterministic engine from the stored records, not by the model."
+        actions={calculation.is_provisional ? <Badge tone="warning">Provisional</Badge> : null}
+      />
+      <PanelBody className="space-y-4">
+        <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+          <Figure
+            label="Invoiced"
+            value={<Amount value={calculation.recorded_total} currency={calculation.currency} />}
+          />
+          <Figure
+            label="Recalculated"
+            value={<Amount value={calculation.recalculated_total} currency={calculation.currency} />}
+          />
+          <Figure
+            label="Difference"
+            value={<Difference value={calculation.difference ?? null} currency={calculation.currency} />}
+          />
+          <Figure
+            label="Outstanding"
+            value={<Amount value={calculation.outstanding ?? null} currency={calculation.currency} />}
+          />
+        </dl>
+
+        {calculation.unresolved_metrics.length > 0 && (
+          <Alert tone="warning">
+            These metrics could not be priced, so the recalculated figure is a lower bound:{' '}
+            <span className="font-mono">{calculation.unresolved_metrics.join(', ')}</span>.
+          </Alert>
         )}
-      </div>
 
-      <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Figure label="Invoiced" value={<Amount value={calculation.recorded_total} currency={calculation.currency} />} />
-        <Figure label="Recalculated" value={<Amount value={calculation.recalculated_total} currency={calculation.currency} />} />
-        <Figure label="Difference" value={<Difference value={calculation.difference ?? null} currency={calculation.currency} />} />
-        <Figure label="Outstanding" value={<Amount value={calculation.outstanding ?? null} currency={calculation.currency} />} />
-      </dl>
-
-      {calculation.unresolved_metrics.length > 0 && (
-        <p className="mt-3 text-xs text-warn-text">
-          These metrics could not be priced, so the recalculated figure is a lower
-          bound: {calculation.unresolved_metrics.join(', ')}.
-        </p>
-      )}
-      <p className="mt-2 text-xs text-ink-faint">
-        Computed by <span className="font-mono">{calculation.engine_version}</span>. These
-        figures come from the deterministic engine, not from the model.
-      </p>
-    </div>
+        <Disclosure summary="How these figures were reached">
+          <div className="space-y-3 rounded-lg border border-line bg-surface-subtle p-3">
+            <div>
+              <p className="text-xs font-medium text-ink">Engine</p>
+              <p className="font-mono text-xs text-ink-muted">{calculation.engine_version}</p>
+            </div>
+            <StructureView label="Calculation trace" value={calculation.trace} />
+          </div>
+        </Disclosure>
+      </PanelBody>
+    </Panel>
   )
 }
 
-function Figure({ label, value }: { label: string; value: React.ReactNode }) {
+function Figure({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div>
-      <dt className="text-xs uppercase tracking-wide text-ink-faint">{label}</dt>
-      <dd className="mt-0.5 text-sm">{value}</dd>
+    <div className="rounded-lg border border-line bg-surface-subtle px-3 py-2.5">
+      <dt className="text-2xs font-medium uppercase tracking-wide text-ink-faint">{label}</dt>
+      <dd className="mt-1 text-base font-semibold">{value}</dd>
     </div>
   )
 }
 
-function EvidenceChips({ keys }: { keys: string[] }) {
+/* -------------------------------------------------------------------------- */
+/* Findings, hypotheses, options                                              */
+/* -------------------------------------------------------------------------- */
+
+function EvidenceChips({ keys, tone = 'neutral' }: { keys: string[]; tone?: 'neutral' | 'danger' }) {
   if (keys.length === 0) {
     return <span className="text-xs text-ink-faint">No citations</span>
   }
@@ -477,7 +672,12 @@ function EvidenceChips({ keys }: { keys: string[] }) {
       {keys.map((key) => (
         <li
           key={key}
-          className="rounded border border-line bg-canvas px-1.5 py-0.5 font-mono text-xs text-ink-muted"
+          className={cn(
+            'rounded border px-1.5 py-0.5 font-mono text-2xs',
+            tone === 'danger'
+              ? 'border-danger-border bg-danger-bg text-danger-text'
+              : 'border-line bg-surface-sunken text-ink-muted',
+          )}
         >
           {key}
         </li>
@@ -489,20 +689,27 @@ function EvidenceChips({ keys }: { keys: string[] }) {
 function ReviewList({ reviews }: { reviews: ReviewResponse[] }) {
   if (reviews.length === 0) return null
   return (
-    <ul className="mt-2 space-y-1 border-l-2 border-line pl-3">
+    <ul className="mt-3 space-y-2 border-l-2 border-accent/30 pl-3">
       {reviews.map((review) => (
         <li key={review.id} className="text-xs">
-          <span className="font-medium">{review.action.replace('_', ' ').toLowerCase()}</span>{' '}
-          <span className="text-ink-muted">
-            by {review.actor_id} ({review.actor_role})
-          </span>
-          {review.rationale && <span className="block text-ink-muted">{review.rationale}</span>}
-          {review.amended_narrative && (
-            <span className="block text-ink-muted">
-              Amended to: {review.amended_narrative}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <Badge tone={review.action === 'REJECT' ? 'danger' : 'accent'} dot={false}>
+              {review.action.replace('_', ' ').toLowerCase()}
+            </Badge>
+            <span className="text-ink-muted">
+              {review.actor_id} ({review.actor_role})
             </span>
+            {!review.is_against_current_evidence && (
+              <span className="text-warning-text">against superseded evidence</span>
+            )}
+            <Fingerprint value={review.evidence_fingerprint_seen} label="reviewer saw" />
+          </div>
+          {review.rationale && <p className="mt-1 text-ink-muted">{review.rationale}</p>}
+          {review.amended_narrative && (
+            <p className="mt-1 text-ink-muted">
+              Amended to: <span className="text-ink">{review.amended_narrative}</span>
+            </p>
           )}
-          <Fingerprint value={review.evidence_fingerprint_seen} label="reviewer saw" />
         </li>
       ))}
     </ul>
@@ -525,91 +732,123 @@ function FindingCard({
   disabled: boolean
 }) {
   return (
-    <article className="rounded border border-line bg-surface p-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-xs text-ink-muted">{finding.code}</span>
-        <span className="rounded border border-line px-1.5 py-0.5 text-xs uppercase text-ink-muted">
-          {finding.severity}
+    <article className="rounded-lg border border-line bg-surface shadow-xs">
+      <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+        <span className="font-mono text-xs font-medium text-ink">{finding.code}</span>
+        <SeverityBadge severity={finding.severity} />
+        <span className="text-xs text-ink-faint">{finding.category}</span>
+        <span className="amount ml-auto text-xs text-ink-muted">
+          confidence {finding.confidence}
         </span>
-        {finding.confidence !== null && (
-          <span className="amount text-xs text-ink-muted">confidence {finding.confidence}</span>
-        )}
       </div>
-      <p className="mt-2 text-sm">{finding.narrative}</p>
-      <div className="mt-2">
-        <EvidenceChips keys={finding.supporting_evidence} />
+      <div className="space-y-3 px-4 py-3.5">
+        <p className="text-sm leading-relaxed text-ink">{finding.narrative}</p>
+        <div>
+          <p className="mb-1 text-2xs font-medium uppercase tracking-wide text-ink-faint">
+            Supported by
+          </p>
+          <EvidenceChips keys={finding.supporting_evidence} />
+        </div>
+        <ReviewList reviews={finding.reviews} />
+        <ReviewForm
+          busy={busy}
+          disabled={disabled}
+          {...(disabled
+            ? { hint: 'This run is stale. Re-run the investigation before reviewing it.' }
+            : {})}
+          onSubmit={(action, rationale, amended) =>
+            onReview(
+              () =>
+                api.recordReview(caseId, {
+                  investigation_id: investigationId,
+                  target_type: 'FINDING',
+                  target_id: finding.id,
+                  action,
+                  rationale,
+                  ...(amended ? { amended_narrative: amended } : {}),
+                }),
+              'Review recorded.',
+            )
+          }
+        />
       </div>
-      <ReviewList reviews={finding.reviews} />
-      <ReviewForm
-        busy={busy}
-        disabled={disabled}
-        {...(disabled
-          ? { hint: 'This run is stale. Re-run the investigation before reviewing it.' }
-          : {})}
-        onSubmit={(action, rationale, amended) =>
-          onReview(
-            () =>
-              api.recordReview(caseId, {
-                investigation_id: investigationId,
-                target_type: 'FINDING',
-                target_id: finding.id,
-                action,
-                rationale,
-                ...(amended ? { amended_narrative: amended } : {}),
-              }),
-            'Review recorded.',
-          )
-        }
-      />
     </article>
   )
 }
 
 function HypothesisCard({ hypothesis }: { hypothesis: HypothesisResponse }) {
   return (
-    <article className="rounded border border-line bg-surface p-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-xs text-ink-muted">{hypothesis.hypothesis_code}</span>
-        <span className="rounded border border-line px-1.5 py-0.5 text-xs uppercase text-ink-muted">
+    <article className="rounded-lg border border-line bg-surface shadow-xs">
+      <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+        <span className="font-mono text-xs font-medium text-ink">{hypothesis.hypothesis_code}</span>
+        <Badge tone="info" dot={false}>
           {hypothesis.status}
-        </span>
+        </Badge>
+        <Badge tone="neutral" dot={false}>
+          not established
+        </Badge>
         {hypothesis.likelihood !== null && (
-          <span className="amount text-xs text-ink-muted">likelihood {hypothesis.likelihood}</span>
+          <span className="amount ml-auto text-xs text-ink-muted">likelihood {hypothesis.likelihood}</span>
         )}
       </div>
-      <p className="mt-2 text-sm font-medium">{hypothesis.title}</p>
-      <p className="text-sm text-ink-muted">{hypothesis.narrative}</p>
-      <p className="amount mt-2 text-sm">{formatMoneyDetail(hypothesis.impact)}</p>
-      <div className="mt-2">
-        <EvidenceChips keys={hypothesis.supporting_evidence} />
+      <div className="space-y-3 px-4 py-3.5">
+        <p className="text-sm font-medium text-ink">{hypothesis.title}</p>
+        <p className="text-sm leading-relaxed text-ink-muted">{hypothesis.narrative}</p>
+        <div className="rounded-lg border border-line bg-surface-subtle px-3 py-2">
+          <p className="text-2xs font-medium uppercase tracking-wide text-ink-faint">Impact</p>
+          <p className="amount mt-0.5 text-sm text-ink">{formatMoneyDetail(hypothesis.impact)}</p>
+          {hypothesis.impact_basis && (
+            <p className="mt-0.5 text-xs text-ink-muted">{hypothesis.impact_basis}</p>
+          )}
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <p className="mb-1 text-2xs font-medium uppercase tracking-wide text-ink-faint">
+              Supporting
+            </p>
+            <EvidenceChips keys={hypothesis.supporting_evidence} />
+          </div>
+          <div>
+            <p className="mb-1 text-2xs font-medium uppercase tracking-wide text-ink-faint">
+              Refuting
+            </p>
+            <EvidenceChips keys={hypothesis.refuting_evidence} tone="danger" />
+          </div>
+        </div>
+        <ReviewList reviews={hypothesis.reviews} />
       </div>
-      <ReviewList reviews={hypothesis.reviews} />
     </article>
   )
 }
 
 function OptionCard({ option }: { option: ResolutionOptionResponse }) {
   return (
-    <article className="rounded border border-line bg-surface p-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-xs text-ink-muted">{option.option_type}</span>
+    <article className="rounded-lg border border-line bg-surface shadow-xs">
+      <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+        <span className="font-mono text-xs font-medium text-ink">{option.option_type}</span>
         {option.requires_human_approval && (
-          <span className="rounded border border-warn-border bg-warn-bg px-1.5 py-0.5 text-xs text-warn-text">
-            Needs human approval
-          </span>
+          <Badge tone="warning">
+            <span className="inline-flex items-center gap-1">
+              <IconLock size={12} />
+              Needs human approval
+            </span>
+          </Badge>
+        )}
+        {option.hypothesis_code && (
+          <span className="text-xs text-ink-faint">for {option.hypothesis_code}</span>
         )}
       </div>
-      <p className="mt-2 text-sm font-medium">{option.title}</p>
-      <p className="text-sm text-ink-muted">{option.rationale}</p>
-      <div className="mt-2">
+      <div className="space-y-3 px-4 py-3.5">
+        <p className="text-sm font-medium text-ink">{option.title}</p>
+        <p className="text-sm leading-relaxed text-ink-muted">{option.rationale}</p>
         <EvidenceChips keys={option.supporting_evidence} />
+        {/* Rendered as text, never as a control. Doing anything here needs the approval
+            workflow, which does not exist yet. */}
+        <p className="text-xs text-ink-faint">
+          This system does not carry out this step. It records what was suggested.
+        </p>
+        <ReviewList reviews={option.reviews} />
       </div>
-      {/* Rendered as text, never as a control. Doing anything here needs the approval
-          workflow, which does not exist yet. */}
-      <p className="mt-2 text-xs text-ink-faint">
-        This system does not carry out this step. It records what was suggested.
-      </p>
-      <ReviewList reviews={option.reviews} />
     </article>
   )
 }
@@ -636,109 +875,167 @@ function ReviewForm({
   const needsText = action === 'AMEND'
   // `busy` is part of the guard as well as `disabled`: without it a double-click on
   // Record would post the same review twice, and reviews are append-only.
-  const invalid =
-    disabled || busy || (needsText ? amended.trim() === '' : rationale.trim() === '')
+  const invalid = disabled || busy || (needsText ? amended.trim() === '' : rationale.trim() === '')
 
   return (
     <form
-      className="mt-3 flex flex-wrap items-center gap-2 border-t border-line pt-3"
+      className="flex flex-wrap items-start gap-2 border-t border-line pt-3"
       onSubmit={(event) => {
         event.preventDefault()
         if (!invalid) void onSubmit(action, rationale, needsText ? amended : undefined)
       }}
     >
-      <label className="sr-only" htmlFor="review-action">
-        Review action
-      </label>
-      <select
-        id="review-action"
-        value={action}
-        onChange={(event) => setAction(event.target.value as ReviewAction)}
-        disabled={disabled}
-        className="rounded border border-line px-2 py-1.5 text-sm"
-      >
-        {REVIEW_ACTIONS.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
+      <Field label="Review action" className="w-44">
+        <Select
+          value={action}
+          onChange={(event) => setAction(event.target.value as ReviewAction)}
+          disabled={disabled}
+        >
+          {REVIEW_ACTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </Select>
+      </Field>
 
       {needsText ? (
-        <>
-          <label className="sr-only" htmlFor="amended-narrative">
-            Replacement wording
-          </label>
-          <input
-            id="amended-narrative"
+        <Field label="Replacement wording" className="min-w-56 flex-1">
+          <TextInput
             value={amended}
             onChange={(event) => setAmended(event.target.value)}
-            placeholder="Replacement wording"
+            placeholder="The wording to record instead"
             disabled={disabled}
-            className="min-w-64 flex-1 rounded border border-line px-2 py-1.5 text-sm"
           />
-        </>
+        </Field>
       ) : (
-        <>
-          <label className="sr-only" htmlFor="review-rationale">
-            Rationale
-          </label>
-          <input
-            id="review-rationale"
+        <Field label="Rationale" className="min-w-56 flex-1">
+          <TextInput
             value={rationale}
             onChange={(event) => setRationale(event.target.value)}
             placeholder="Why?"
             disabled={disabled}
-            className="min-w-64 flex-1 rounded border border-line px-2 py-1.5 text-sm"
           />
-        </>
+        </Field>
       )}
 
-      <button
-        type="submit"
-        disabled={invalid}
-        className="rounded border border-line bg-surface px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        Record
-      </button>
-      {hint && <span className="w-full text-xs text-warn-text">{hint}</span>}
+      <div className="pt-[1.375rem]">
+        <Button type="submit" disabled={invalid}>
+          Record
+        </Button>
+      </div>
+      {hint && <p className="w-full text-xs text-warning-text">{hint}</p>}
     </form>
   )
 }
 
+/* -------------------------------------------------------------------------- */
+/* Evidence                                                                   */
+/* -------------------------------------------------------------------------- */
+
 function EvidencePanel({ detail }: { detail: CaseDetail }) {
   return (
-    <section>
-      <h2 className="text-sm font-semibold">Evidence ({detail.evidence.length})</h2>
-      <p className="text-xs text-ink-muted">
-        Every key a finding may cite. A citation that names something absent from this
-        list is a bug, not a gap.
-      </p>
-      <div className="mt-2 overflow-x-auto">
-        <table className="w-full text-left text-xs">
-          <thead className="text-ink-faint">
-            <tr>
-              <th className="py-1 pr-4 font-medium">Natural key</th>
-              <th className="py-1 pr-4 font-medium">Type</th>
-              <th className="py-1 font-medium">Content hash</th>
-            </tr>
-          </thead>
-          <tbody>
-            {detail.evidence.map((item) => (
-              <tr key={`${item.natural_key}-${item.content_hash}`} className="border-t border-line">
-                <td className="py-1 pr-4 font-mono">{item.natural_key}</td>
-                <td className="py-1 pr-4 text-ink-muted">{item.evidence_type}</td>
-                <td className="py-1">
-                  <Fingerprint value={item.content_hash} />
-                </td>
+    <Panel>
+      <PanelHeader
+        title={`Evidence (${detail.evidence.length})`}
+        description="Every key a finding may cite. A citation that names something absent from this list is a bug, not a gap."
+      />
+      <PanelBody className="space-y-4">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="text-ink-faint">
+              <tr className="text-2xs uppercase tracking-wide">
+                <th scope="col" className="py-1.5 pr-4 font-medium">
+                  Natural key
+                </th>
+                <th scope="col" className="py-1.5 pr-4 font-medium">
+                  Type
+                </th>
+                <th scope="col" className="py-1.5 font-medium">
+                  Content hash
+                </th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </section>
+            </thead>
+            <tbody>
+              {detail.evidence.map((item) => (
+                <tr key={`${item.natural_key}-${item.content_hash}`} className="border-t border-line">
+                  <td className="py-1.5 pr-4 font-mono text-ink">{item.natural_key}</td>
+                  <td className="py-1.5 pr-4 text-ink-muted">{item.evidence_type}</td>
+                  <td className="py-1.5">
+                    <Fingerprint value={item.content_hash} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {detail.evidence.length > 0 && (
+          <Disclosure summary={`Inspect a snapshot (${detail.evidence.length})`}>
+            <ul className="space-y-1">
+              {detail.evidence.map((item) => (
+                <li key={`${item.natural_key}-snapshot`}>
+                  <Disclosure summary={item.natural_key} tone="plain">
+                    <StructureView label={item.evidence_type} value={item.snapshot} />
+                  </Disclosure>
+                </li>
+              ))}
+            </ul>
+          </Disclosure>
+        )}
+      </PanelBody>
+    </Panel>
   )
 }
+
+/**
+ * A readable view of an arbitrary stored object.
+ *
+ * Snapshots and traces are free-form bags the server passes through, so this shows
+ * the top level as labelled rows and drops anything nested into a formatted block.
+ * That keeps a small snapshot legible without dumping a wall of JSON for a big one.
+ */
+function StructureView({ label, value }: { label: string; value: Record<string, unknown> }) {
+  const entries = Object.entries(value)
+  if (entries.length === 0) {
+    return <p className="text-xs text-ink-muted">{label}: nothing recorded.</p>
+  }
+  return (
+    <dl className="space-y-1.5">
+      {entries.map(([key, entry]) => (
+        <div key={key} className="grid grid-cols-[minmax(0,11rem)_1fr] gap-2">
+          <dt className="truncate font-mono text-xs text-ink-muted" title={key}>
+            {key}
+          </dt>
+          <dd className="min-w-0 text-xs text-ink">
+            <ValueView value={entry} />
+          </dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+function ValueView({ value }: { value: unknown }) {
+  if (value === null || value === undefined) {
+    return <span className="text-ink-faint">null</span>
+  }
+  if (typeof value === 'string') {
+    return <span className="break-words">{value}</span>
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return <span className="font-mono">{String(value)}</span>
+  }
+  return (
+    <pre className="mt-0.5 overflow-x-auto rounded bg-surface-sunken p-2 font-mono text-2xs leading-relaxed text-ink-muted">
+      {JSON.stringify(value, null, 2)}
+    </pre>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* History, decisions, audit                                                  */
+/* -------------------------------------------------------------------------- */
 
 function HistoryPanel({
   runs,
@@ -749,35 +1046,39 @@ function HistoryPanel({
 }) {
   if (runs.length <= 1) return null
   return (
-    <section>
-      <h2 className="text-sm font-semibold">Run history</h2>
-      <p className="text-xs text-ink-muted">
-        Superseded runs are kept. Comparing a run against what the evidence said then is
-        the reason they exist.
-      </p>
-      <ul className="mt-2 space-y-2">
-        {runs.map((run) => (
-          <li key={run.id} className="rounded border border-line bg-surface px-3 py-2 text-xs">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium">Version {run.version}</span>
-              {run.id === currentId && <span className="text-ink-muted">(shown above)</span>}
-              <StaleBadge isStale={run.is_stale} version={run.version} />
-              <span className="text-ink-muted">
-                read <Fingerprint value={run.evidence_fingerprint} label="run fingerprint" />
-              </span>
-              <span className="text-ink-faint">{run.created_at}</span>
-            </div>
-            {run.calculation && (
-              <p className="amount mt-1">
-                recalculated {run.calculation.recalculated_total}{' '}
-                {run.calculation.currency}
-                {run.calculation.is_provisional && ' (provisional)'}
-              </p>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
+    <Panel>
+      <PanelHeader
+        title="Run history"
+        description="Superseded runs are kept. Comparing a run against what the evidence said then is the reason they exist."
+      />
+      <PanelBody>
+        <ul className="space-y-2">
+          {runs.map((run) => (
+            <li key={run.id} className="rounded-lg border border-line bg-surface-subtle px-3 py-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium text-ink">Version {run.version}</span>
+                {run.id === currentId && (
+                  <Badge tone="accent" dot={false}>
+                    shown above
+                  </Badge>
+                )}
+                <StaleBadge isStale={run.is_stale} version={run.version} />
+                <span className="text-ink-muted">
+                  read <Fingerprint value={run.evidence_fingerprint} label="run fingerprint" />
+                </span>
+                <span className="ml-auto text-ink-faint">{run.created_at}</span>
+              </div>
+              {run.calculation && (
+                <p className="amount mt-1 text-ink-muted">
+                  recalculated {run.calculation.recalculated_total} {run.calculation.currency}
+                  {run.calculation.is_provisional && ' (provisional)'}
+                </p>
+              )}
+            </li>
+          ))}
+        </ul>
+      </PanelBody>
+    </Panel>
   )
 }
 
@@ -827,60 +1128,84 @@ function auditDetail(event: AuditEventResponse): string | null {
  */
 function AuditPanel({ history }: { history: AuditHistory }) {
   return (
-    <section>
-      <h2 className="text-sm font-semibold">Audit trail ({history.total})</h2>
-      <p className="text-xs text-ink-muted">
-        Everything that happened to this case, oldest first. Append-only: nothing here can
-        be edited or removed.
-      </p>
-      <ol className="mt-2 space-y-1">
-        {history.items.map((event) => (
-          <li
-            key={event.id}
-            className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 rounded border border-line bg-surface px-3 py-1.5 text-xs"
-          >
-            <span className="font-medium">{AUDIT_LABELS[event.event_type]}</span>
-            {auditDetail(event) && <span className="text-ink-muted">{auditDetail(event)}</span>}
-            <span className="text-ink-muted">
-              {event.actor_id
-                ? event.actor_role
-                  ? `by ${event.actor_id} (${event.actor_role})`
-                  : `by ${event.actor_id}`
-                : 'by system'}
-            </span>
-            {event.entity_version !== null && (
-              <span className="text-ink-faint">version {event.entity_version}</span>
-            )}
-            <span className="text-ink-faint">{event.occurred_at}</span>
-          </li>
-        ))}
-      </ol>
-    </section>
+    <Panel>
+      <PanelHeader
+        title={`Audit trail (${history.total})`}
+        description="Everything that happened to this case, oldest first. Append-only: nothing here can be edited or removed."
+      />
+      <PanelBody>
+        <ol className="space-y-0.5">
+          {history.items.map((event) => (
+            <li
+              key={event.id}
+              className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 border-l-2 border-line py-1 pl-3 text-xs"
+            >
+              <span className="font-medium text-ink">{AUDIT_LABELS[event.event_type]}</span>
+              {auditDetail(event) && <span className="text-ink-muted">{auditDetail(event)}</span>}
+              <span className="text-ink-muted">
+                {event.actor_id
+                  ? event.actor_role
+                    ? `by ${event.actor_id} (${event.actor_role})`
+                    : `by ${event.actor_id}`
+                  : 'by system'}
+              </span>
+              {event.entity_version !== null && (
+                <span className="text-ink-faint">version {event.entity_version}</span>
+              )}
+              <span className="ml-auto text-ink-faint">{event.occurred_at}</span>
+            </li>
+          ))}
+        </ol>
+      </PanelBody>
+    </Panel>
   )
 }
 
 function DecisionHistory({ decisions }: { decisions: DecisionResponse[] }) {
   return (
-    <section>
-      <h2 className="text-sm font-semibold">Closing decisions</h2>
-      <p className="text-xs text-ink-muted">
-        Every verdict that closed the case. A reopened case keeps its history.
-      </p>
-      <ul className="mt-2 space-y-2">
-        {decisions.map((decision) => (
-          <li key={decision.id} className="rounded border border-line bg-surface px-3 py-2 text-xs">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium">{decision.decision.toLowerCase()}</span>
-              <span className="text-ink-muted">
-                by {decision.actor_id} ({decision.actor_role})
-              </span>
-              <span className="text-ink-faint">{decision.created_at}</span>
-            </div>
-            {decision.rationale && <p className="mt-1 text-ink-muted">{decision.rationale}</p>}
-            <Fingerprint value={decision.evidence_fingerprint_seen} label="decided against" />
-          </li>
-        ))}
-      </ul>
-    </section>
+    <Panel>
+      <PanelHeader
+        title="Closing decisions"
+        description="Every verdict that closed the case. A reopened case keeps its history."
+      />
+      <PanelBody>
+        <ul className="space-y-2">
+          {decisions.map((decision) => (
+            <li key={decision.id} className="rounded-lg border border-line bg-surface-subtle px-3 py-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={decision.decision === 'RESOLVED' ? 'success' : 'danger'}>
+                  {decision.decision.toLowerCase()}
+                </Badge>
+                <span className="text-ink-muted">
+                  {decision.actor_id} ({decision.actor_role})
+                </span>
+                <span className="ml-auto text-ink-faint">{decision.created_at}</span>
+              </div>
+              {decision.rationale && <p className="mt-1 text-ink-muted">{decision.rationale}</p>}
+              <Fingerprint value={decision.evidence_fingerprint_seen} label="decided against" />
+            </li>
+          ))}
+        </ul>
+      </PanelBody>
+    </Panel>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Loading                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function DetailSkeleton() {
+  return (
+    <div className="space-y-6">
+      <Skeleton className="h-3 w-32" />
+      <div className="space-y-3">
+        <Skeleton className="h-6 w-48" />
+        <Skeleton className="h-4 w-96" />
+        <Skeleton className="h-4 w-72" />
+      </div>
+      <Skeleton className="h-40 w-full rounded-lg" />
+      <Skeleton className="h-28 w-full rounded-lg" />
+    </div>
   )
 }

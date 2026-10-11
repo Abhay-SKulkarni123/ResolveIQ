@@ -303,3 +303,65 @@ export interface ApiErrorBody {
     request_id: string
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * Request shapes sent to the API.
+ *
+ * These are the client-side counterparts of the backend's *request* schemas, so
+ * they are deliberately **not** mirrored by `contract.test.ts` (that snapshot
+ * covers response schemas only). They exist so the open-dispute form is typed
+ * against exactly what the server accepts. Amounts are strings here for the
+ * same reason they are in the responses: a float in the payload would be a
+ * different number than the one stored.
+ * ------------------------------------------------------------------------- */
+
+export type DisputeSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+
+export interface MoneyInput {
+  amount: string
+  currency: string
+}
+
+export interface InvoiceLineInput {
+  metric_key: string
+  line_type: 'USAGE' | 'FIXED'
+  recorded_amount: MoneyInput
+}
+
+export interface InvoiceInput {
+  external_id: string
+  currency: string
+  period_start: string
+  period_end: string
+  stated_total: MoneyInput
+  lines: InvoiceLineInput[]
+}
+
+export interface UsageEventInput {
+  external_id: string
+  dedupe_key: string
+  metric_key: string
+  occurred_at: string
+  quantity: string
+  unit: string
+}
+
+/**
+ * POST /disputes — mirrors the backend's `OpenDisputeRequest`.
+ *
+ * `usage_events` is optional: when omitted the server stores an empty list. The
+ * other optional record collections (`price_terms`, `payments`, `adjustments`)
+ * are intentionally not built by this form; the fields exist on the endpoint and
+ * are supported by the API, but the first release of the form covers the records
+ * a reviewer most often has to hand. New records can be attached to a live case
+ * afterwards through the evidence flow.
+ */
+export interface OpenDisputeRequest {
+  dispute_external_id: string
+  invoice: InvoiceInput
+  contract_external_id: string
+  dispute_text: string
+  severity: DisputeSeverity
+  description: string
+  usage_events?: UsageEventInput[]
+}

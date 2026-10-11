@@ -17,6 +17,7 @@ import type {
   CaseStatus,
   DecisionKind,
   DecisionResponse,
+  OpenDisputeRequest,
   ReviewAction,
   ReviewResponse,
   ReviewTargetType,
@@ -213,6 +214,22 @@ export const api = {
     request(`/disputes/${id}/decision`, {
       method: 'POST',
       body: JSON.stringify({ decision, rationale }),
+    }),
+
+  /**
+   * Open a dispute from its source records.
+   *
+   * The backend is idempotent: a retried delivery with the same `Idempotency-Key`
+   * returns the case the first delivery opened instead of opening a second one.
+   * The form mints one key per load, so re-submitting deliberately (or retrying
+   * after a timeout) reuses the same token. A fresh load is a fresh intent, and
+   * gets a fresh key.
+   */
+  createDispute: (payload: OpenDisputeRequest, idempotencyKey: string): Promise<CaseDetail> =>
+    request('/disputes', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(payload),
     }),
 
   /**
