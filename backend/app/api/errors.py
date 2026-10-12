@@ -212,6 +212,30 @@ def install_error_handlers(application: FastAPI) -> None:
             str(exc.detail) if exc.detail else "The request could not be handled.",
         )
 
+    @application.exception_handler(Exception)
+    def _unhandled(_: Request, exc: Exception) -> JSONResponse:
+        # The last line of defence for a genuine bug. Without it Starlette answers with
+        # a bare ``Internal Server Error``, which is a second error shape the frontend
+        # would have to understand and which tells a caller nothing it can act on. The
+        # exception is logged with its traceback and its category, and the response
+        # carries neither: an unhandled exception's message can contain request data or
+        # a file path, and neither belongs in a body a browser will render.
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "api.error.responded",
+            exc_info=True,
+            status_code=500,
+            code="INTERNAL_ERROR",
+            error_category=error_category(exc),
+        )
+        return error_response(
+            500,
+            "INTERNAL_ERROR",
+            "An unexpected error occurred and the request was not completed.",
+            {"retryable": True},
+        )
+
 
 def _sanitise_validation(errors: Sequence[Any]) -> list[dict[str, Any]]:
     """Strip values out of pydantic's error list.

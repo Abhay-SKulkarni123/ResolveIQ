@@ -11,7 +11,9 @@ explanation fits that evidence, computes every monetary amount with exact decima
 evidence behind each finding, proposes remedies — and then **stops and waits for a human**.
 
 > **Read [`DEPLOYMENT.md`](./DEPLOYMENT.md) before deploying.** This build is a **demo / evaluation**
-> deployment, not a production one. Authentication and a real AI provider are the two hard blockers.
+> deployment, not a production one. Real token-based authentication and an OpenAI-compatible provider
+> adapter now exist, but the container path, live provider calls, TLS, backups and observability are
+> still unverified — see the production blockers.
 
 ---
 
@@ -33,9 +35,10 @@ ResolveIQ is a **reviewer workbench**, not an autonomous agent.
 - **Key capabilities.** Deterministic recalculating billing engine; evidence collection with content
   fingerprints and staleness detection; closed hypothesis vocabulary; evidence-cited findings; full case
   lifecycle (open → investigate → review → decide → reopen) with an append-only audit trail.
-- **Important limitations.** No real authentication (demo headers only); mock-only AI provider; no
-  money-moving path (adjustments are deliberately out of scope); container path unverified. See §9 and
-  [`DEPLOYMENT.md`](./DEPLOYMENT.md).
+- **Important limitations.** The default identity is still demo headers (spoofable); token mode exists
+  but has no login UI. The OpenAI-compatible provider is unverified against a live endpoint; the mock is
+  the default. No money-moving path (adjustments are deliberately out of scope); container path
+  unverified. See §8 and [`DEPLOYMENT.md`](./DEPLOYMENT.md).
 
 ### The core idea
 
@@ -73,8 +76,8 @@ Hexagonal / ports-and-adapters.
              └───────┬───────────────┬────┘   └────────┬─────────────┘
         ┌────────────▼──────┐ ┌──────▼──────────┐ ┌─────▼──────────────┐
         │ domain/ +         │ │ adapters/llm/   │ │ adapters/          │
-        │ pricing/          │ │  mock provider  │ │  persistence/      │
-        │ (pure Decimal)    │ │                 │ │  (SQLAlchemy)      │
+        │ pricing/          │ │  mock + openai  │ │  persistence/      │
+        │ (pure Decimal)    │ │ adapters/auth/  │ │  (SQLAlchemy)      │
         └───────────────────┘ └─────────────────┘ └────────────────────┘
 ```
 
@@ -84,11 +87,12 @@ Hexagonal / ports-and-adapters.
 | --- | --- |
 | `backend/app/domain/` | `Money`, evidence, hypotheses, cases. Imports nothing from other layers. |
 | `backend/app/pricing/` | Deterministic calculators, rounding, traces, impact registry. |
-| `backend/app/ports/` | `LlmProvider`, `CaseRepository`, provider contracts. |
+| `backend/app/ports/` | `LlmProvider`, `IdentityProvider`, `CaseRepository`, provider contracts. |
 | `backend/app/services/` | Investigation orchestration, evidence collection, citation validation, case lifecycle, recovery. |
-| `backend/app/adapters/llm/` | The `MockLlmProvider`. |
+| `backend/app/adapters/llm/` | The `MockLlmProvider` and the `OpenAiCompatibleProvider` (selected by `build_provider`). |
+| `backend/app/adapters/auth/` | The demo-header provider and the HS256 bearer-token provider. |
 | `backend/app/adapters/persistence/` | SQLAlchemy models, repositories, database/session wiring, DDL. |
-| `backend/app/api/` | FastAPI routes, Pydantic schemas, dependencies, error handlers, request middleware. |
+| `backend/app/api/` | FastAPI routes, Pydantic schemas, dependencies, error handlers, middleware, hardening. |
 | `backend/migrations/` | Alembic revisions (`0001`–`0005`). |
 | `backend/tests/` | `unit/`, `contract/`, `integration/`. |
 | `frontend/src/` | React workbench: `api/`, `components/`, `pages/`, `test/`. |
@@ -116,6 +120,12 @@ money engine be tested with no database and no mocks.
 **Deterministic engine vs. provider.** The engine owns every monetary value; the provider only selects a
 `hypothesis_code` from the closed set and narrates it, citing evidence. The provider's response schema has
 no money field, so a model cannot state an amount even if prompted to.
+
+**Identity vs. authorization.** A request's identity is resolved by an `IdentityProvider`: `AUTH_MODE=demo`
+reads the `X-Actor-Id`/`X-Actor-Role` headers (a label, `authenticated=false`), while `AUTH_MODE=token`
+verifies a signed HS256 bearer token and takes the role from the signed claims. Every route depends on one
+`Actor` either way, and the single role gate — the decision endpoint requiring `reviewer` — consults the
+*verified* role whenever a token was presented. `APP_ENV=production` refuses to start in demo mode.
 
 ---
 
@@ -255,14 +265,23 @@ of them and calls a relative `/api/v1`. Copy `.env.example` to `.env` and edit. 
 | `DATABASE_URL` | PostgreSQL on `localhost` | SQLAlchemy URL: `postgresql+psycopg://…` or `mysql+pymysql://…` |
 | `TEST_DATABASE_URL` | derived sibling | **Disposable** — the migration tests downgrade it to base |
 | `CASE_STORE` | `postgres` | Durable store, or `memory` (ephemeral, explicit, never a fallback) |
-| `LLM_PROVIDER` | `mock` | The only value implemented |
+| `LLM_PROVIDER` | `mock` | `mock` (offline, deterministic) or `openai` (OpenAI-compatible HTTP) |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | Endpoint for the `openai` provider (hosted or self-hosted gateway) |
 | `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES` | | |
-| `LLM_API_KEY` | *(empty)* | Required only once a real provider is wired in |
+| `LLM_API_KEY` | *(empty)* | Required when `LLM_PROVIDER=openai`; the app refuses to start without it |
+| `ALLOWED_HOSTS` | `*` | Host header allow-list; production refuses `*` |
+| `EXPOSE_DOCS` | *(empty = auto)* | Swagger/ReDoc/`openapi.json`: on in dev/test, off in production |
+| `SECURITY_HEADERS_ENABLED` | `true` | nosniff / frame-deny / referrer-policy headers |
+| `RATE_LIMIT_ENABLED` | `false` | Fixed-window limiter (always on in production) |
+| `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` | `120` / `60` | Limit per client host |
+| `AUTH_MODE` | `demo` | `demo` (spoofable headers) or `token` (verified bearer); production requires `token` |
+| `AUTH_SECRET` | *(empty)* | HS256 signing secret; ≥16 chars required in token mode |
+| `AUTH_ISSUER` / `AUTH_TOKEN_TTL_SECONDS` / `AUTH_LEEWAY_SECONDS` | `resolveiq` / `3600` / `30` | Token `iss`, lifetime, and clock-skew allowance |
 | `PROMPT_VERSION` | `prompt-v1` | Stored per investigation for attribution |
 | `INVESTIGATION_TTL_HOURS` | `24` | Fingerprint validity before a run is stale |
 | `INVESTIGATION_MAX_ATTEMPTS` | `3` | Retries before a run completes with its last result |
 | `DISPUTE_DESCRIPTION_MAX_CHARS` | `10000` | Untrusted input cap |
-| `DEMO_IDENTITY_ENABLED` | `true` | See §8 |
+| `DEMO_IDENTITY_ENABLED` | `true` | Only used when `AUTH_MODE=demo`; see §8 |
 | `DEMO_DEFAULT_ACTOR_ID` / `_ROLE` | `dev-analyst` / `analyst` | |
 
 **Never give a secret a `VITE_` prefix.** Vite inlines `VITE_*` variables into the browser bundle at build
@@ -387,8 +406,9 @@ Submit it over the API with a `+00:00` timestamp for the usage event:
 | `POST` | `/disputes/{dispute_id}/reopen` | Reopen a closed case; mandatory reason |
 | `GET` | `/disputes/{dispute_id}/audit` | Append-only audit trail, oldest-first |
 
-`/docs` (Swagger) and `/openapi.json` are always served. A local snapshot of the OpenAPI document is kept
-at `frontend/src/api/openapi.snapshot.json` and checked against the TypeScript types by
+`/docs` (Swagger) and `/openapi.json` are served in development and test. With `APP_ENV=production` they
+are withheld by default (both the UI and the schema — see `EXPOSE_DOCS`). A local snapshot of the OpenAPI
+document is kept at `frontend/src/api/openapi.snapshot.json` and checked against the TypeScript types by
 `frontend/src/test/contract.test.ts`.
 
 **Request schemas and validation** (`backend/app/api/schemas.py`):
@@ -435,23 +455,26 @@ frontend toolchain. Re-run to reproduce. Report only what these commands actuall
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Backend unit + contract | `cd backend && .venv/Scripts/python.exe -m pytest tests/unit tests/contract` | **1058 passed, 3 skipped** |
+| Backend unit + contract | `cd backend && .venv/Scripts/python.exe -m pytest tests/unit tests/contract` | **1131 passed, 3 skipped** |
 | Backend integration | `.venv/Scripts/python.exe -m pytest tests/integration` | **74 passed** (0 failed, 0 skipped) |
 | Ruff | `.venv/Scripts/python.exe -m ruff check .` | **All checks passed** |
-| mypy (strict) | `.venv/Scripts/python.exe -m mypy app` | **Success, 52 source files** |
+| mypy (strict) | `.venv/Scripts/python.exe -m mypy app` | **Success, 59 source files** |
 | Migration parity | `alembic current` / `alembic heads` | **`0005_audit_events`** on both |
 | Frontend tests | `cd frontend && npm test` | **66 passed (4 files)** |
 | TypeScript | `npm run typecheck` | **clean** |
 | ESLint | `npm run lint` | **clean** |
-| Frontend build | `npm run build` | **clean** — `212.09 kB` JS (`63.88 kB` gzip), `25.14 kB` CSS |
+| Frontend build | `npm run build` | **clean** — `212.24 kB` JS (`63.97 kB` gzip), `25.14 kB` CSS |
 | Compose config | `docker compose config` | **valid** (build/up **not** run — no Docker daemon) |
 
 **Coverage by kind**
 
 - **Unit** — domain/pricing/engine, services, API surface against the in-memory store, persistence model
-  metadata. The HTTP tests deliberately run against `CASE_STORE=memory`, so they double as the "no
-  database required" path.
-- **Contract** — every `LlmProvider` must satisfy a conformance suite; the mock provider is the only one.
+  metadata, token authentication (signature, expiry, identity), and the hardening middleware (host
+  allow-list, security headers, rate limiting, docs gating). The HTTP tests deliberately run against
+  `CASE_STORE=memory`, so they double as the "no database required" path.
+- **Contract** — every `LlmProvider` must satisfy a conformance suite. Both providers are run through it:
+  the deterministic mock, and the OpenAI-compatible adapter driven by an `httpx.MockTransport` so its
+  parsing, timeout, retry and error-mapping paths are exercised without a network.
 - **Integration** — real-database behaviour: migrations up/down, model/migration parity, CHECK-constraint
   behaviour, dialect portability. Requires a live database.
 - **Frontend** — component/interaction tests (Testing Library) and an OpenAPI-snapshot contract test that
@@ -479,17 +502,22 @@ field. Payments hold only an `external_id`, an amount and its per-invoice alloca
 data. `.env` and `.env.*` are gitignored (`.env.example` holds placeholders only); no `VITE_*` secret
 exists. `/health` reports the provider *mode*, never key material.
 
-**Not real — do not mistake this for authentication.** Identity is a pair of development headers
-(`X-Actor-Id`, `X-Actor-Role`). **These are trivially spoofable.** The only role gate is the decision
-endpoint requiring `reviewer`, and it trusts this header. `DEMO_IDENTITY_ENABLED=false` does not replace
-it with real authentication — it only stops the development default from being applied. A real deployment
-needs signed tokens/sessions, a server-verified principal, server-side authorization, and enforced
-separation of duties.
+**Authentication is real in token mode; demo mode is not.** With `AUTH_MODE=token` the server verifies a
+signed HS256 bearer token, checks its issuer, expiry and role claims, and authorises the decision endpoint
+on the *verified* role. `APP_ENV=production` refuses to start unless token mode is selected with a strong
+`AUTH_SECRET`. The default `AUTH_MODE=demo` identity is a pair of development headers (`X-Actor-Id`,
+`X-Actor-Role`) that **are trivially spoofable**; `DEMO_IDENTITY_ENABLED=false` only stops the
+development default from being applied. Tokens are bearer credentials — serve over TLS, keep the TTL short,
+and treat `AUTH_SECRET` as a root secret. What is still missing for a production deployment is the
+*integration*: token issuance is a manual operator CLI and the frontend reads a token from `localStorage`
+(there is no login UI), leaving issuing to the real identity source as the remaining work.
 
-**The AI provider is mock-only.** `LLM_PROVIDER` is `Literal["mock"]`; `MockLlmProvider` is deterministic
-and offline, and is the only provider implemented. The port is exercised by the contract suite, but
-nothing here has been run against a hosted model. Monetary figures always come from the deterministic
-engine.
+**The AI provider is injectable; both ends are tested, only the mock is verified in the field.**
+`LLM_PROVIDER=mock` is deterministic and offline (the default); `LLM_PROVIDER=openai` selects an
+OpenAI-compatible HTTP adapter that requires `LLM_API_KEY` and speaks to `LLM_BASE_URL`. Both are run
+through the `LlmProvider` contract suite — the HTTP adapter via a stubbed transport — but no live model has
+been called from this repository. Monetary figures always come from the deterministic engine, and the
+provider's response schema has no money field.
 
 **Which databases are actually tested.** PostgreSQL is the reference design target; MySQL 8 was verified
 locally (unit, contract and 74 integration tests, and the end-to-end smoke). The honest caveat: MySQL
@@ -498,9 +526,10 @@ the API and the billing domain, and would surface differently on PostgreSQL's `t
 PostgreSQL compatibility merely because a Compose service exists — run the suite against it first.
 
 **Other limitations.** Adjustments (any money-moving path) are deliberately not implemented. There is no
-real LLM provider and no production authentication. No rate limiting, no `TrustedHostMiddleware`, and
-`/docs` is always exposed. There is no deterministic demo seed data — a fresh database is empty. The
-Docker/Compose path is unverified.
+login UI (token mode bootstraps from `localStorage`), the live provider call is unverified, and the
+Docker/Compose path is unverified. There is no deterministic demo seed data — a fresh database is empty.
+Rate limiting is per-process (a coarse cap behind multiple replicas), and there is no metrics endpoint or
+alerting — only structured logs.
 
 **Residual risk.** Prompt injection is mitigated, not eliminated: a model can still be led to a *wrong but
 well-formed, correctly-cited* conclusion. Mandatory human review plus the deterministic engine exist for
@@ -513,9 +542,9 @@ exactly that reason.
 > **Verdict: demo / evaluation deployment ready — not production ready.** Full runbook, environment
 > matrix, health/log guidance and the production blocker list are in **[`DEPLOYMENT.md`](./DEPLOYMENT.md)**.
 
-Two hard blockers keep this out of production: **no real authentication** and **mock-only AI provider**.
-See `DEPLOYMENT.md` §Production blockers for the complete list (trusted hosts, docs exposure, TLS,
-reverse-proxy expectations, and the unverified container path).
+Authentication (`AUTH_MODE=token`) and an OpenAI-compatible provider adapter are implemented, but the
+**container path has never been run**, no **live provider** call has been made, and TLS, backups and
+observability remain to be done. See `DEPLOYMENT.md` §Production blockers for the complete list.
 
 **Images.** `backend/Dockerfile` is Python 3.12-slim, runs as a non-root user, and includes `alembic.ini`
 and `migrations/` so migrations can run in the container; it declares a healthcheck. `frontend/Dockerfile`
@@ -531,8 +560,10 @@ docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d api web-pr
 ```
 
 The demo overlay runs the API from the **image** (no bind mount, no `--reload`), serves the built bundle
-via nginx, and does **not** publish the database port to the host. The plain `docker-compose.yml` is the
-**local development** stack (hot reload, Vite dev server).
+via nginx, and does **not** publish the database port to the host. It deliberately runs
+`APP_ENV=development` with `AUTH_MODE=demo`, so the browser demo needs no login; it is a demo profile, not
+a production one. The plain `docker-compose.yml` is the **local development** stack (hot reload, Vite dev
+server).
 
 > **The container path has never been executed in this repository** — no Docker daemon was available
 > either time it was touched. `docker compose config` (and the merged overlay) parses cleanly, but treat
@@ -548,8 +579,9 @@ never a `downgrade base` against anything but the disposable test database.
 | Document | Contents |
 | --- | --- |
 | `README.md` | This guide: overview, architecture, setup, usage, API, testing, security. |
-| `DEPLOYMENT.md` | Deployment runbook, environment matrix, health/logs, TLS, production blockers. |
-| `backend/.env.example` | Every backend setting, commented, with placeholders. |
+| `DEPLOYMENT.md` | Deployment runbook, auth/provider/hardening, backup/restore, monitoring, production blockers. |
+| `.env.example` | Every backend setting, commented, with placeholders. |
+| `.github/workflows/ci.yml` | CI: backend unit/contract/lint/mypy, PostgreSQL integration, frontend lint/types/tests/build. |
 | `frontend/src/api/openapi.snapshot.json` | Snapshot of the API schema, checked against the TS types. |
 
 `docs/` (engineering decisions, system design, traceability) is intentionally **local-only** and

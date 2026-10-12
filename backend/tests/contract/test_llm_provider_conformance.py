@@ -26,13 +26,16 @@ import sys
 from collections.abc import Mapping
 from datetime import date
 
+import httpx
 import pytest
 
 from app.adapters.llm.mock import MockLlmProvider
+from app.adapters.llm.openai_compatible import OpenAiCompatibleProvider
 from app.domain.billing import InvoicePeriod
 from app.domain.evidence import EvidenceBundle, EvidenceItem, EvidenceType
-from app.domain.hypotheses import requires_approval
+from app.domain.hypotheses import FindingSeverity, requires_approval
 from app.domain.money import Money
+from app.ports.interpretation import Finding, InterpretationResponse
 from app.ports.llm import (
     InterpretationRequest,
     LlmNotConfiguredError,
@@ -83,14 +86,56 @@ def request_for(bundle: EvidenceBundle | None = None) -> InterpretationRequest:
     )
 
 
+def _canned_response() -> InterpretationResponse:
+    """A valid response the OpenAI transport stub returns for every request.
+
+    Built as a real :class:`InterpretationResponse` rather than as a JSON literal, so it
+    cannot drift from the schema it is meant to satisfy. It cites a key from
+    :func:`evidence`, so the allowlist cases hold.
+    """
+    return InterpretationResponse(
+        summary="The recorded rate does not agree with the contract's tiered term.",
+        findings=(
+            Finding(
+                code="RATE_MISMATCH",
+                severity=FindingSeverity.WARN,
+                category="PRICING",
+                narrative="The recorded amount for api_calls does not match the tiered term.",
+                confidence="0.9",
+                supporting_evidence=("invoice:INV-1#line:api_calls",),
+            ),
+        ),
+    )
+
+
+def _openai_provider() -> OpenAiCompatibleProvider:
+    """The real adapter, driven by an ``httpx`` transport stub instead of the network.
+
+    This is how the adapter is held to the conformance suite in an offline test run: the
+    HTTP boundary is a mock, the provider, its request building, its response parsing and
+    its schema validation are all the shipping code.
+    """
+    canned = _canned_response().model_dump_json()
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": canned}}]})
+
+    return OpenAiCompatibleProvider(
+        api_key="conformance-key",
+        model="conformance-model",
+        transport=httpx.MockTransport(handler),
+    )
+
+
 def providers() -> list[object]:
     """Every provider registered with the application.
 
     A single place to add an adapter. A real provider is added here and is immediately
     held to everything below — which is the mechanism that makes "adding a real provider
-    does not touch the domain" true rather than aspirational.
+    does not touch the domain" true rather than aspirational. The OpenAI-compatible
+    adapter is included with its transport stubbed, so the suite stays offline.
     """
-    return [MockLlmProvider()]
+    return [MockLlmProvider(), _openai_provider()]
 
 
 #: Substrings that would indicate a field able to carry money. Mirrors the check in
@@ -388,19 +433,23 @@ class TestTheEvidenceAFixtureProviderIsGiven:
 
 
 class TestRealProviderEvidence:
-    """Recorded once, so the claim in the docs cannot drift into an assumption.
+    """Recorded so the claim in the docs cannot drift into an assumption.
 
     docs/SYSTEM_DESIGN.md §7.1 says a real provider arrives as an adapter plus this
-    conformance run. No adapter exists yet (OQ-08), so nothing here has been exercised
-    against a hosted model, and this test records that fact rather than leaving it to be
-    assumed.
+    conformance run. That adapter now exists -- :class:`OpenAiCompatibleProvider` -- and
+    every case above is run against it with its HTTP transport stubbed. What has *not*
+    happened is a call to a live hosted model in this test run, and this class records
+    that distinction rather than leaving it to be inferred from a green suite.
     """
 
-    def test_no_real_provider_is_registered(self) -> None:
-        assert [type(p) for p in providers()] == [MockLlmProvider]
+    def test_the_registered_providers_are_the_mock_and_the_openai_adapter(self) -> None:
+        assert [type(p) for p in providers()] == [MockLlmProvider, OpenAiCompatibleProvider]
 
-    def test_the_mock_is_the_only_implementation(self) -> None:
-        assert len(providers()) == 1
+    def test_the_real_adapter_is_exercised_offline_by_this_suite(self) -> None:
+        """Not a live-host run: the point is that the adapter's own code paths are covered."""
+        openai = next(p for p in providers() if isinstance(p, OpenAiCompatibleProvider))
+        assert openai.name == "openai"
+        assert isinstance(openai.structured_infer(request_for()), InterpretationResponse)
 
 
 class TestAMinimalViableFixture:

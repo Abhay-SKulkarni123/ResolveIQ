@@ -14,14 +14,16 @@
 #                the database; only the api container reaches it, over the
 #                internal network.
 #   * api      — runs the built image with NO bind mount and NO --reload, so the
-#                running code is the image, not a working copy. APP_ENV=production
-#                disables SQL echo and any development-only behaviour.
+#                running code is the image, not a working copy.
 #   * web-prod — unchanged: nginx serving the compiled bundle and proxying /api.
 #
 # THIS IS A DEMO CONFIGURATION, NOT A PRODUCTION ONE. Two things in particular are
 # deliberate and must not be mistaken for readiness:
-#   1. DEMO_IDENTITY_ENABLED=true keeps the spoofable X-Actor-Id / X-Actor-Role
-#      header identity. There is no real authentication in this build.
+#   1. It runs with APP_ENV=development and AUTH_MODE=demo, so the spoofable
+#      X-Actor-Id / X-Actor-Role header identity is the mechanism. That keeps the
+#      browser demo usable with no login step. A real deployment sets
+#      APP_ENV=production and AUTH_MODE=token, which the application enforces at
+#      startup (it refuses to boot otherwise); see DEPLOYMENT.md §Authentication.
 #   2. LLM_PROVIDER is fixed to `mock`. No hosted model is contacted.
 # See DEPLOYMENT.md §Production blockers before exposing this to anyone but
 # yourself or a small evaluation audience.
@@ -36,9 +38,13 @@ services:
     volumes: !reset []
     command: !override ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
-      APP_ENV: production
+      # Labelled development on purpose: this overlay demonstrates the workflow, and
+      # the demo identity path is only permitted outside production.
+      APP_ENV: development
       CASE_STORE: postgres
-      # Demo-only identity. Real authentication is a production blocker.
+      # Demo-only identity. Real authentication (AUTH_MODE=token) is required in
+      # production and is enforced by the application; see DEPLOYMENT.md.
+      AUTH_MODE: demo
       DEMO_IDENTITY_ENABLED: "true"
       # The nginx service (web-prod) is published on 8080; that origin is what a
       # browser calls from, so it is the one allowed to call the API.

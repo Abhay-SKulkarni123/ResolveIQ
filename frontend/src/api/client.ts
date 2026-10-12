@@ -109,11 +109,26 @@ export function setActor(id: string, role: string): void {
   actor = { id, role }
 }
 
+/**
+ * An optional verified bearer token.
+ *
+ * When the backend runs in `AUTH_MODE=token` the actor headers above are ignored and
+ * this is the identity that counts. It is set by the deployment (a host page or a
+ * future login flow), not by this module, and stays null in the demo mode so the
+ * headers remain the mechanism.
+ */
+let authToken: string | null = null
+
+export function setAuthToken(token: string | null): void {
+  authToken = token
+}
+
 function headers(extra: Record<string, string> = {}): Record<string, string> {
   return {
     'Content-Type': 'application/json',
     'X-Actor-Id': actor.id,
     'X-Actor-Role': actor.role,
+    ...(authToken !== null ? { Authorization: `Bearer ${authToken}` } : {}),
     ...extra,
   }
 }

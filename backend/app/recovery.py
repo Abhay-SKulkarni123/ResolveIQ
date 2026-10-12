@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
-from app.adapters.llm.mock import MockLlmProvider
+from app.adapters.llm import build_provider
 from app.adapters.persistence.case_repository import SqlAlchemyCaseRepository
 from app.adapters.persistence.database import create_engine_for_url, session_scope
 from app.config import Settings, get_settings
@@ -83,7 +83,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _service(settings: Settings, session: Session) -> CaseService:
-    provider = MockLlmProvider(name=settings.llm_provider, model=settings.llm_model)
+    provider = build_provider(settings)
     return CaseService(
         SqlAlchemyCaseRepository(session),
         provider,

@@ -95,6 +95,7 @@ from app.domain.cases import (
 )
 from app.domain.contracts import BillingMode
 from app.domain.evidence import EvidenceItem, EvidenceType
+from app.domain.identity import can_decide
 from app.domain.json_frozen import thaw_json
 from app.domain.money import Money
 from app.services.cases import OpenCaseCommand
@@ -785,7 +786,10 @@ def decide_dispute(
     """
     service, _ = service_dep
     actor = actor_dep
-    if actor.role != "reviewer":
+    if not can_decide(actor.role):
+        # ``can_decide`` is the single authorisation predicate, so the rule lives in
+        # one place rather than as a string comparison here. The role is the verified
+        # one when a token was presented and the declared one under the demo headers.
         raise ApiError(
             403,
             "REVIEWER_REQUIRED",
@@ -891,8 +895,8 @@ def capabilities(
         "store": kind,
         "persistence_is_durable": kind == "postgres",
         "identity": {
-            "mode": "demo-header",
-            "is_authentication": False,
+            "mode": actor_dep.source,
+            "is_authentication": actor_dep.authenticated,
             "actor_id": actor_dep.id,
             "actor_role": actor_dep.role,
         },

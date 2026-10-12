@@ -1,0 +1,107 @@
+# Continuous integration.
+#
+# Three independent jobs so a failure names what broke: the backend without a database,
+# the backend against a real PostgreSQL, and the frontend. The unit job runs offline and
+# is the fast gate; the integration job is the only place the migration up/down path is
+# exercised against PostgreSQL (locally it is frequently run against MySQL instead).
+#
+# The PostgreSQL service below is what makes the integration tests actually run in CI.
+# Without it they skip -- by design, so a developer with no database still gets a green
+# unit suite -- which would otherwise mean the schema was never verified here either.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend (unit + contract)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Type-check
+        run: mypy app
+      - name: Unit and contract tests
+        run: pytest tests/unit tests/contract
+
+  backend-integration:
+    name: Backend (PostgreSQL integration)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: resolveiq
+          POSTGRES_PASSWORD: resolveiq
+          POSTGRES_DB: resolveiq
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U resolveiq"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://resolveiq:resolveiq@localhost:5432/resolveiq
+      TEST_DATABASE_URL: postgresql+psycopg://resolveiq:resolveiq@localhost:5432/resolveiq_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Create the disposable test database
+        env:
+          PGPASSWORD: resolveiq
+        run: psql -h localhost -U resolveiq -d resolveiq -c "CREATE DATABASE resolveiq_test OWNER resolveiq;"
+      - name: Integration tests
+        run: pytest tests/integration
+
+  frontend:
+    name: Frontend (lint, types, tests, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Type-check
+        run: npm run typecheck
+      - name: Tests
+        run: npm test
+      - name: Build
+        run: npm run build

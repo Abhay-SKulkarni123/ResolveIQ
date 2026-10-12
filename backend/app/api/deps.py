@@ -22,15 +22,16 @@ already durable and no record of it. Holding the transaction to the edge of the
 request also gives §10's "no partial writes" for free: a case and its investigations
 become durable together or not at all.
 
-**Identity is a header and is labelled as such.** ``X-Actor-Id`` and ``X-Actor-Role``
-are read from the request and stored as a label on each annotation. They are not
-authentication (OQ-01): trivially spoofable, no signature, no session. The role is
-recorded so a reviewer can see who claimed what. It is consulted in exactly one
-place -- the decision endpoint insists it say ``reviewer``, because a closing verdict
-is the one action that permanently changes the lifecycle -- and everywhere else it is
-**not** consulted for any authorisation decision: separation of duties beyond that
-single gate is a later phase, and a role check built on a spoofable header would
-appear to work and would not.
+**Identity comes from an identity provider, not from the route.** Which provider is
+built is configuration: ``AUTH_MODE=demo`` keeps the OQ-01 ``X-Actor-Id`` /
+``X-Actor-Role`` headers (a label, ``authenticated=False``), and ``AUTH_MODE=token``
+verifies a signed bearer token and returns ``authenticated=True``. Every route depends
+on one :class:`Actor` either way, so nothing downstream changes when the mechanism
+does. Production refuses to start on the demo mode, so the spoofable-header path cannot
+be the one a deployment ships. The role is consulted in exactly one place -- the
+decision endpoint insists on ``reviewer`` (:func:`app.domain.identity.can_decide`),
+because a closing verdict permanently changes the lifecycle -- and it is the *verified*
+role whenever a token was presented.
 """
 
 from __future__ import annotations
@@ -43,14 +44,15 @@ from typing import Annotated
 from fastapi import Depends, Header, Request
 from sqlalchemy.orm import Session
 
-from app.adapters.llm.mock import MockLlmProvider
+from app.adapters.auth import DemoIdentityProvider, HmacTokenIdentityProvider
+from app.adapters.llm import build_provider
 from app.adapters.persistence.case_repository import SqlAlchemyCaseRepository
 from app.adapters.persistence.database import get_sessionmaker
 from app.adapters.persistence.memory_case_repository import InMemoryCaseRepository
 from app.config import Settings, get_settings
 from app.logging_config import error_category, log_event
+from app.ports.auth import AuthenticationError, Credentials, IdentityProvider, Principal
 from app.ports.cases import CaseRepository
-from app.ports.llm import LlmProvider
 from app.services.cases import CaseService
 
 __all__ = [
@@ -70,16 +72,27 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class Actor:
-    """Who the request claims to be.
+    """The identity that resolved this request, and whether it was verified.
 
-    A record of a claim, nothing more. ``role`` is carried so it can be displayed and
-    stored, and it is consulted in exactly one place (the decision route's reviewer
-    gate); a future authorisation layer must not inherit it as an authority -- it is
-    still a spoofable header.
+    ``authenticated`` is ``False`` for the demo header path and ``True`` when a provider
+    verified a credential; ``source`` names the mechanism. Both are carried into
+    ``/capabilities`` and the audit trail so a consumer can never read a declared
+    identity as a verified one. ``id``/``role`` keep the names the routes already use.
     """
 
     id: str
     role: str
+    authenticated: bool = False
+    source: str = "demo-header"
+
+    @classmethod
+    def from_principal(cls, principal: Principal) -> Actor:
+        return cls(
+            id=principal.subject,
+            role=principal.role,
+            authenticated=principal.authenticated,
+            source=principal.source,
+        )
 
 
 #: ``"postgres"`` or ``"memory"``. Reported by ``GET /api/v1/capabilities`` so the
@@ -95,44 +108,67 @@ def store_kind(settings_dep: Annotated[Settings, Depends(settings)]) -> StoreKin
     return settings_dep.case_store
 
 
-def actor(
+def identity_provider(
     settings_dep: Annotated[Settings, Depends(settings)],
-    x_actor_id: Annotated[str | None, Header(alias="X-Actor-Id")] = None,
-    x_actor_role: Annotated[str | None, Header(alias="X-Actor-Role")] = None,
-) -> Actor:
-    """Read the development identity from request headers.
+) -> IdentityProvider:
+    """Build the configured identity provider.
 
-    Falls back to the configured default so the API is usable from a browser without
-    a header, and so a reviewer using the UI is never blocked by a missing one. That
-    convenience is precisely why this is not authentication: it grants an identity to
-    anyone who asks.
+    ``token`` verifies a signed bearer token and refuses to construct with a weak or
+    missing secret; ``demo`` keeps the header path. The choice is configuration only --
+    routes depend on the resolved :class:`Actor`, not on the mechanism.
     """
-    if not settings_dep.demo_identity_enabled:
-        raise _identity_disabled()
-    actor_id = (x_actor_id or settings_dep.demo_default_actor_id).strip()
-    role = (x_actor_role or settings_dep.demo_default_actor_role).strip()
-    if not actor_id:
-        raise _identity_invalid("X-Actor-Id must not be blank")
-    if not role:
-        raise _identity_invalid("X-Actor-Role must not be blank")
-    return Actor(id=actor_id[:128], role=role[:64])
-
-
-def _identity_disabled() -> Exception:
-    from app.api.errors import ApiError
-
-    return ApiError(
-        401,
-        "IDENTITY_REQUIRED",
-        "Demo identity is disabled and this build has no authentication. "
-        "Send X-Actor-Id and X-Actor-Role.",
+    if settings_dep.auth_mode == "token":
+        return HmacTokenIdentityProvider(
+            secret=settings_dep.auth_secret,
+            issuer=settings_dep.auth_issuer,
+            leeway_seconds=settings_dep.auth_leeway_seconds,
+        )
+    return DemoIdentityProvider(
+        enabled=settings_dep.demo_identity_enabled,
+        default_actor_id=settings_dep.demo_default_actor_id,
+        default_actor_role=settings_dep.demo_default_actor_role,
     )
 
 
-def _identity_invalid(message: str) -> Exception:
+def credentials(
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+    x_actor_id: Annotated[str | None, Header(alias="X-Actor-Id")] = None,
+    x_actor_role: Annotated[str | None, Header(alias="X-Actor-Role")] = None,
+) -> Credentials:
+    """The raw identity material on the request: the bearer token and the demo headers.
+
+    Read once here so the provider receives a plain value and the route layer never
+    touches a header.
+    """
+    return Credentials(
+        authorization=authorization,
+        actor_id=x_actor_id,
+        actor_role=x_actor_role,
+    )
+
+
+def actor(
+    provider: Annotated[IdentityProvider, Depends(identity_provider)],
+    creds: Annotated[Credentials, Depends(credentials)],
+) -> Actor:
+    """Resolve the request identity, or fail with the provider's error.
+
+    An :class:`AuthenticationError` carries the stable code and HTTP status the envelope
+    should use, so this maps it to an ``ApiError`` rather than inventing one here. The
+    provider's message is safe to surface (it never names the credential), but the
+    underlying reason is not logged with it.
+    """
+    try:
+        principal = provider.authenticate(creds)
+    except AuthenticationError as exc:
+        raise _authentication_error(exc) from exc
+    return Actor.from_principal(principal)
+
+
+def _authentication_error(exc: AuthenticationError) -> Exception:
     from app.api.errors import ApiError
 
-    return ApiError(422, "INVALID_IDENTITY", message)
+    return ApiError(exc.status_code, exc.code, str(exc))
 
 
 def idempotency_key(
@@ -150,17 +186,6 @@ def idempotency_key(
         return None
     key = value.strip()
     return key or None
-
-
-def build_provider(settings_dep: Settings) -> LlmProvider:
-    """The configured model provider.
-
-    ``llm_provider`` is a ``Literal["mock"]``, so this cannot accidentally build a
-    networked client. Adding a real provider is a config change *and* a code change,
-    which is deliberate: a phase that adds a hosted model must also add the budget cap,
-    the redaction and the prompt-injection framing that go with it (NEP-004, NEP-005).
-    """
-    return MockLlmProvider(name=settings_dep.llm_provider, model=settings_dep.llm_model)
 
 
 def memory_repository(request: Request) -> InMemoryCaseRepository:

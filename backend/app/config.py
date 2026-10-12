@@ -85,6 +85,34 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"]
     )
+    # Host header allow-list for TrustedHostMiddleware. "*" is convenient in
+    # development and refused in production, where a concrete list is required.
+    allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["*"])
+    # Whether Swagger/ReDoc and /openapi.json are served. Tri-state on purpose:
+    # unset (``None``) is "auto" -- on in development and test, off in production, so a
+    # deployment does not publish an exhaustive map of its own surface by default.
+    # ``EXPOSE_DOCS=true`` opts back in explicitly; ``false`` forces them off everywhere.
+    expose_docs: bool | None = None
+    # Baseline security response headers (nosniff, frame-deny, referrer-policy).
+    # Harmless for a JSON API and cheap insurance where a browser is involved.
+    security_headers_enabled: bool = True
+    # A fixed-window in-process limiter. Always on in production (see app.main) and
+    # opt-in elsewhere so ordinary test runs are not throttled.
+    rate_limit_enabled: bool = False
+    rate_limit_requests: int = 120
+    rate_limit_window_seconds: int = 60
+
+    # -- identity / authentication ------------------------------------------
+    # "demo"  reads the spoofable X-Actor-Id / X-Actor-Role headers (OQ-01).
+    # "token" verifies an Authorization: Bearer <HS256 JWT> and takes the role from
+    #         the signed claims. Production requires "token" (enforced below).
+    auth_mode: Literal["demo", "token"] = "demo"
+    # Signing secret for AUTH_MODE=token. Never logged. Must be >=16 chars in token
+    # mode; production should use at least 32 random bytes from a secret store.
+    auth_secret: str = ""
+    auth_issuer: str = "resolveiq"
+    auth_token_ttl_seconds: int = 3600
+    auth_leeway_seconds: int = 30
 
     # -- database ------------------------------------------------------------
     database_url: str = "postgresql+psycopg://resolveiq:resolveiq@localhost:5432/resolveiq"
@@ -95,9 +123,14 @@ class Settings(BaseSettings):
 
     # -- llm -----------------------------------------------------------------
     # STK-06: "mock" is the default so the app runs offline and tests are
-    # deterministic. A real provider adapter is not implemented yet (OQ-08).
-    llm_provider: Literal["mock"] = "mock"
+    # deterministic. "openai" selects the OpenAI-compatible HTTP adapter and requires
+    # LLM_API_KEY; the deterministic billing engine remains the authority for money
+    # either way.
+    llm_provider: Literal["mock", "openai"] = "mock"
     llm_model: str = "mock-deterministic-v1"
+    # Base URL of an OpenAI-compatible chat-completions API. Points at api.openai.com
+    # by default and at a self-hosted gateway for an on-prem deployment.
+    llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_timeout_seconds: int = 30
     llm_max_retries: int = 2
@@ -134,7 +167,7 @@ class Settings(BaseSettings):
     demo_default_actor_id: str = "dev-analyst"
     demo_default_actor_role: Literal["analyst", "reviewer"] = "analyst"
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("cors_origins", "allowed_hosts", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
         """Accept a comma-separated string as well as a list.
@@ -146,6 +179,21 @@ class Settings(BaseSettings):
         """
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("expose_docs", mode="before")
+    @classmethod
+    def _read_docs_flag(cls, value: object) -> object:
+        """Make ``EXPOSE_DOCS=`` mean "auto" rather than a validation error.
+
+        An empty value is the normal way to leave an optional switch unset in an env
+        file, and ``auto`` is the word an operator would reach for; both resolve to
+        ``None`` so :func:`create_app` can apply the environment-dependent default.
+        """
+        if isinstance(value, str):
+            normalised = value.strip().lower()
+            if normalised in ("", "auto"):
+                return None
         return value
 
     @model_validator(mode="after")
@@ -160,6 +208,43 @@ class Settings(BaseSettings):
         """
         if not self.test_database_url:
             self.test_database_url = _sibling_database_url(self.database_url, TEST_DATABASE_NAME)
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_production_safety(self) -> Settings:
+        """Refuse to start a production configuration that is not safe to expose.
+
+        These are startup errors rather than logged warnings on purpose: a deployment
+        that boots with spoofable identity, a wildcard CORS origin, a wildcard host
+        allow-list or a missing signing secret *looks* healthy and is not, and the
+        person who would notice is the one least likely to read a warning in a log.
+        Failing to start makes the misconfiguration impossible to miss.
+
+        Development and test are left permissive: the whole point of the demo path is
+        that it runs with no configuration.
+        """
+        if self.app_env != "production":
+            return self
+        if self.auth_mode != "token":
+            raise ValueError(
+                "APP_ENV=production requires AUTH_MODE=token: the demo header identity "
+                "is not authentication and must not gate a production deployment"
+            )
+        if len(self.auth_secret) < 16:
+            raise ValueError(
+                "APP_ENV=production with AUTH_MODE=token requires AUTH_SECRET of at "
+                "least 16 characters (32+ recommended) from a secret store"
+            )
+        if "*" in self.cors_origins:
+            raise ValueError(
+                "APP_ENV=production refuses CORS_ORIGINS='*': list the exact frontend "
+                "origin(s), because credentialed CORS with a wildcard is unsafe"
+            )
+        if "*" in self.allowed_hosts:
+            raise ValueError(
+                "APP_ENV=production refuses ALLOWED_HOSTS='*': list the hostnames this "
+                "service answers to, so a spoofed Host header is rejected"
+            )
         return self
 
 
