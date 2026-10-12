@@ -56,7 +56,7 @@ from app.domain.cases import (
     ReviewTargetType,
 )
 from app.domain.contracts import BillingMode
-from app.domain.evidence import EvidenceType
+from app.domain.evidence import EvidenceBundle, EvidenceType
 from app.domain.json_frozen import thaw_json
 from app.domain.money import Money
 from app.ports.cases import CaseConflictError, CaseNotFoundError
@@ -1862,4 +1862,81 @@ def test_resuming_over_evidence_that_moved_fails_the_run() -> None:
     # The case is investigable again rather than stuck mid-run. New evidence had already
     # reopened it; the failure leaves that in place rather than forcing it to OPEN.
     assert stored.is_open_for_investigation is True
+
+
+# ---------------------------------------------------------------------------
+# The case's evidence and an investigation's evidence must be the same bundle
+# ---------------------------------------------------------------------------
+
+
+def test_a_case_with_no_price_terms_can_be_investigated() -> None:
+    """Regression: the two evidence paths must select the same usage summaries.
+
+    The API's open-dispute form sends an invoice and usage events but no contract
+    price terms. A summary keyed off the invoice's lines (the old investigation rule)
+    would appear in the run's bundle and be absent from the stored one, so the
+    fingerprint check refused every such case and stranded it in INVESTIGATING.
+    """
+    repository = InMemoryCaseRepository()
+    service = CaseService(repository, MockLlmProvider())
+    case = service.open_case(
+        OpenCaseCommand(
+            dispute_external_id="DSC-NO-TERMS",
+            invoice=invoice(),
+            contract_external_id="CTR-5512",
+            dispute_text="We were billed the wrong rate for API calls.",
+            usage_events=[usage()],
+        )
+    )
+    # The stored bundle really carries no usage summary; that is what the run has to
+    # reproduce rather than add to.
+    assert case.evidence.of_type(EvidenceType.USAGE_SUMMARY) == ()
+
+    run = service.investigate(case.id, prompt_version="prompt-v1")
+
+    # The run is stored rather than refused; it is DEGRADED only because, with no price
+    # terms, the invoice line cannot be reconciled -- an honest caveat, not the
+    # fingerprint mismatch that used to strand the case.
+    assert run.status is InvestigationRunStatus.DEGRADED
+    assert run.evidence_fingerprint == case.evidence_fingerprint
+    stored = service.get(case.id)
+    assert stored.status is CaseStatus.AWAITING_REVIEW
+    assert [event.event_type for event in service.list_audit(case.id)] == [
+        AuditEventType.CASE_CREATED,
+        AuditEventType.INVESTIGATION_COMPLETED,
+    ]
+
+
+def test_investigation_is_refused_when_stored_evidence_disagrees_with_the_document() -> None:
+    """The integrity check still fires for genuinely divergent evidence.
+
+    Tampering with the stored bundle so it no longer matches what the ingest payload
+    rebuilds is exactly the mismatch the fingerprint exists to catch. The run must be
+    failed and the case left re-investigable, not stored under the wrong fingerprint.
+    """
+    repository = InMemoryCaseRepository()
+    service = CaseService(repository, MockLlmProvider())
+    case = service.open_case(command())
+    tampered = replace(
+        case,
+        evidence=EvidenceBundle.of(
+            [
+                *case.evidence.items,
+                EvidenceItem.create("invoice:TAMPERED", EvidenceType.INVOICE, {"note": "altered"}),
+            ]
+        ),
+    )
+    repository.save(tampered, expected_version=case.version)
+
+    with pytest.raises(CaseTransitionError, match="does not match"):
+        service.investigate(case.id, prompt_version="prompt-v1")
+
+    stored = service.get(case.id)
+    failed = stored.investigations[-1]
+    assert failed.status is InvestigationRunStatus.FAILED
+    assert not failed.findings
+    assert failed.calculation is None
+    assert stored.is_open_for_investigation is True
+    event_types = [event.event_type for event in service.list_audit(case.id)]
+    assert event_types == [AuditEventType.CASE_CREATED, AuditEventType.INVESTIGATION_FAILED]
 

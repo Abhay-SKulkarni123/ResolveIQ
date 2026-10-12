@@ -25,10 +25,12 @@ customer said is the customer's actual words rather than a summary chosen by the
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 
 from app.domain.billing import (
     InvoiceLine,
+    InvoicePeriod,
     Payment,
     PriceTerm,
     RecordedInvoice,
@@ -36,9 +38,15 @@ from app.domain.billing import (
 )
 from app.domain.evidence import EvidenceBundle, EvidenceItem, EvidenceType
 from app.domain.money import Money
-from app.pricing.usage import UsageSummary
+from app.pricing.usage import UsageSummary, summarise_usage
 
-__all__ = ["build_evidence_bundle", "contract_term_key", "dispute_text_key", "invoice_key"]
+__all__ = [
+    "build_evidence_bundle",
+    "contract_term_key",
+    "dispute_text_key",
+    "invoice_key",
+    "usage_summaries_for",
+]
 
 
 def invoice_key(invoice_external_id: str) -> str:
@@ -77,6 +85,34 @@ def payment_allocation_key(payment_external_id: str, invoice_external_id: str) -
 
 def dispute_text_key(dispute_external_id: str) -> str:
     return f"dispute_text:{dispute_external_id}"
+
+
+def usage_summaries_for(
+    price_terms: Sequence[PriceTerm],
+    usage_events: Sequence[UsageEvent],
+    period: InvoicePeriod,
+) -> list[UsageSummary]:
+    """The usage summaries a case's evidence carries: one per priced metric.
+
+    This is the single definition of *which* summaries exist, so the bundle a case
+    stores at open time and the bundle every later investigation rebuilds cannot
+    disagree about them. That agreement is what the staleness check in
+    :meth:`CaseService.investigate` relies on: it compares fingerprints produced by
+    different code paths, and if those paths selected different metrics a case would
+    look permanently stale the moment it was opened.
+
+    Keyed off the contract's price terms rather than off the invoice's lines or the
+    usage events. A price term is what makes a metric priceable, so a summary for a
+    metric with no term could be cited but never reconciled against a rule -- and a
+    metric that appears in usage but not on the invoice is not part of this dispute.
+    Every term yields a summary even with no matching events, because zero is a real
+    answer meaning "no metered usage in this period"; omitting it would leave the
+    model a gap it could only read as missing data.
+
+    Term order is preserved, but :class:`~app.domain.evidence.EvidenceBundle` sorts by
+    ``natural_key``, so the resulting fingerprint does not depend on it.
+    """
+    return [summarise_usage(term.metric_key, list(usage_events), period) for term in price_terms]
 
 
 def _decimal_text(value: Decimal) -> str:

@@ -181,4 +181,104 @@ describe('the open-dispute flow', () => {
     // Success lands on the case it opened, rather than leaving the reviewer on the form.
     expect(await screen.findByText('Invoice', { selector: 'dt' })).toBeInTheDocument()
   })
+
+  it('sends an explicit contract price term in the invoice currency', async () => {
+    await openForm()
+
+    await userEvent.type(screen.getByLabelText('Dispute reference'), 'DSC-SYN-1')
+    await userEvent.type(screen.getByLabelText('Contract reference'), 'CTR-SYN-API')
+    fireEvent.change(screen.getByLabelText('Dispute text'), {
+      target: { value: 'Synthetic pricing check' },
+    })
+    await userEvent.type(screen.getByLabelText('Invoice reference'), 'INV-SYN-1')
+    fireEvent.change(screen.getByLabelText('Period start'), { target: { value: '2026-03-01' } })
+    fireEvent.change(screen.getByLabelText('Period end'), { target: { value: '2026-03-31' } })
+    await userEvent.type(screen.getByLabelText('Stated total'), '28.40')
+    await userEvent.type(screen.getByLabelText('Metric key 1'), 'api_calls')
+    await userEvent.type(screen.getByLabelText('Recorded amount'), '28.40')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Add price term' }))
+    await userEvent.type(screen.getByLabelText('Price metric 1'), 'api_calls')
+    await userEvent.type(screen.getByLabelText('Rate 1'), '0.0013')
+    await userEvent.type(screen.getByLabelText('Included units 1'), '10000')
+
+    await userEvent.click(submitButton())
+
+    await waitFor(() => expect(api.createDispute).toHaveBeenCalledTimes(1))
+    const [payload] = vi.mocked(api.createDispute).mock.calls[0]!
+    expect(payload.price_terms).toEqual([
+      {
+        metric_key: 'api_calls',
+        billing_mode: 'PER_UNIT',
+        currency: 'USD',
+        included_units: '10000',
+        unit_price: { amount: '0.0013', currency: 'USD' },
+      },
+    ])
+  })
+
+  it('sends a usage timestamp the API can place, not a bare local wall-clock', async () => {
+    await openForm()
+
+    await userEvent.type(screen.getByLabelText('Dispute reference'), 'DSC-SYN-3')
+    await userEvent.type(screen.getByLabelText('Contract reference'), 'CTR-SYN-API')
+    fireEvent.change(screen.getByLabelText('Dispute text'), {
+      target: { value: 'Synthetic usage pricing check' },
+    })
+    await userEvent.type(screen.getByLabelText('Invoice reference'), 'INV-SYN-3')
+    fireEvent.change(screen.getByLabelText('Period start'), { target: { value: '2026-03-01' } })
+    fireEvent.change(screen.getByLabelText('Period end'), { target: { value: '2026-03-31' } })
+    await userEvent.type(screen.getByLabelText('Stated total'), '28.40')
+    await userEvent.type(screen.getByLabelText('Metric key 1'), 'api_calls')
+    await userEvent.type(screen.getByLabelText('Recorded amount'), '28.40')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Add usage record' }))
+    await userEvent.type(screen.getByLabelText('External id 1'), 'USE-SYN-3')
+    await userEvent.type(screen.getByLabelText('Dedupe key'), 'DK-USE-SYN-3')
+    await userEvent.type(screen.getByLabelText('Metric key'), 'api_calls')
+    // A <input type="datetime-local"> yields a wall-clock with no offset.
+    fireEvent.change(screen.getByLabelText('Occurred at'), {
+      target: { value: '2026-03-15T09:00' },
+    })
+    await userEvent.type(screen.getByLabelText('Quantity'), '41234')
+    await userEvent.type(screen.getByLabelText('Unit'), 'calls')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Add price term' }))
+    await userEvent.type(screen.getByLabelText('Price metric 1'), 'api_calls')
+    await userEvent.type(screen.getByLabelText('Rate 1'), '0.0013')
+    await userEvent.type(screen.getByLabelText('Included units 1'), '10000')
+
+    await userEvent.click(submitButton())
+
+    await waitFor(() => expect(api.createDispute).toHaveBeenCalledTimes(1))
+    const [payload] = vi.mocked(api.createDispute).mock.calls[0]!
+    // The API rejects a naive timestamp as ambiguous, and does not read a trailing 'Z'
+    // on Python 3.10; the offset has to be written out.
+    expect(payload.usage_events?.[0]?.occurred_at).toBe('2026-03-15T09:00:00+00:00')
+    expect(payload.price_terms).toHaveLength(1)
+  })
+
+  it('refuses to send a price term without a rate', async () => {
+    await openForm()
+
+    await userEvent.type(screen.getByLabelText('Dispute reference'), 'DSC-SYN-2')
+    await userEvent.type(screen.getByLabelText('Contract reference'), 'CTR-SYN-API')
+    fireEvent.change(screen.getByLabelText('Dispute text'), {
+      target: { value: 'Synthetic pricing check' },
+    })
+    await userEvent.type(screen.getByLabelText('Invoice reference'), 'INV-SYN-2')
+    fireEvent.change(screen.getByLabelText('Period start'), { target: { value: '2026-03-01' } })
+    fireEvent.change(screen.getByLabelText('Period end'), { target: { value: '2026-03-31' } })
+    await userEvent.type(screen.getByLabelText('Stated total'), '28.40')
+    await userEvent.type(screen.getByLabelText('Metric key 1'), 'api_calls')
+    await userEvent.type(screen.getByLabelText('Recorded amount'), '28.40')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Add price term' }))
+    await userEvent.type(screen.getByLabelText('Price metric 1'), 'api_calls')
+
+    await userEvent.click(submitButton())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/need attention/i)
+    expect(api.createDispute).not.toHaveBeenCalled()
+  })
 })

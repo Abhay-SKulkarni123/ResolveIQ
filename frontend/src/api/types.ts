@@ -346,15 +346,52 @@ export interface UsageEventInput {
   unit: string
 }
 
+export interface TierInput {
+  up_to: string | null
+  unit_price: MoneyInput
+}
+
+/**
+ * The pricing modes this form can express.
+ *
+ * Deliberately narrower than the backend's `BillingMode`: a rate with an optional
+ * allowance (`PER_UNIT`) and a rate with a committed floor (`COMMITMENT`). A
+ * `TIERED` ladder is a different editor — a list of brackets with its own
+ * progressive arithmetic — and building one here would be a second pricing
+ * implementation in the browser. The API still accepts `tiered` terms; this form
+ * simply does not construct them.
+ */
+export type PriceTermBillingMode = 'PER_UNIT' | 'COMMITMENT'
+
+/**
+ * One contract price term — mirrors the backend's `PriceTermInput`.
+ *
+ * `currency` is required by the schema but is set from the invoice's currency by
+ * the form rather than typed, so a term can never be submitted in a currency the
+ * invoice is not in (the engine refuses a cross-currency term rather than
+ * converting). `unit_price`, `overage_price`, `minimum_commitment` and `tiers` are
+ * optional because they are mode-dependent; the form only ever sends the ones its
+ * chosen mode needs.
+ */
+export interface PriceTermInput {
+  metric_key: string
+  billing_mode: PriceTermBillingMode
+  currency: string
+  included_units?: string
+  unit_price?: MoneyInput
+  overage_price?: MoneyInput
+  minimum_commitment?: MoneyInput
+  tiers?: TierInput[]
+}
+
 /**
  * POST /disputes — mirrors the backend's `OpenDisputeRequest`.
  *
- * `usage_events` is optional: when omitted the server stores an empty list. The
- * other optional record collections (`price_terms`, `payments`, `adjustments`)
- * are intentionally not built by this form; the fields exist on the endpoint and
- * are supported by the API, but the first release of the form covers the records
- * a reviewer most often has to hand. New records can be attached to a live case
- * afterwards through the evidence flow.
+ * Every optional record collection is omitted when the form has nothing to send,
+ * so an unchanged payload is byte-identical to what earlier clients sent. When
+ * `price_terms` is omitted the server stores none, and an investigation into an
+ * unpriced metric is reported as degraded rather than priced with a charge nobody
+ * agreed to.
  */
 export interface OpenDisputeRequest {
   dispute_external_id: string
@@ -363,5 +400,6 @@ export interface OpenDisputeRequest {
   dispute_text: string
   severity: DisputeSeverity
   description: string
+  price_terms?: PriceTermInput[]
   usage_events?: UsageEventInput[]
 }

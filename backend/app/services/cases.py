@@ -575,7 +575,15 @@ class CaseService:
         actor_id: str | None,
         actor_role: str | None,
     ) -> InvestigationRecord:
-        """Bring a pending run to the ``FAILED`` tombstone and record why."""
+        """Bring a pending run to the ``FAILED`` tombstone and record why.
+
+        Committed on its own before this returns. The marker this replaces was written
+        ahead and committed in :meth:`CaseRepository.begin_investigation` (ADR-008), so
+        the terminal write has to be committed too; when the caller then raises -- the
+        fingerprint-mismatch paths -- the request-level rollback would otherwise undo
+        the tombstone and strand the case in ``INVESTIGATING`` behind a pending run no
+        later request can get past.
+        """
         failed = case.fail_investigation(pending.id, reason=reason)
         self._repository.save(failed, expected_version=case.version)
         record = next(run for run in failed.investigations if run.id == pending.id)
@@ -589,6 +597,7 @@ class CaseService:
             entity_version=failed.version,
             payload={"investigation_version": record.version, "reason": reason},
         )
+        self._repository.commit()
         log_event(
             LOGGER,
             logging.WARNING,

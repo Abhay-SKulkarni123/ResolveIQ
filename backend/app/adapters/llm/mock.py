@@ -122,8 +122,10 @@ class MockLlmProvider:
                     "be exercised end to end; it asserts no cause."
                 ),
                 confidence="1",
-                supporting_evidence=tuple(key for key in [invoice_key, *line_keys[:1]] if key)
-                or (invoice_key,),
+                supporting_evidence=(
+                    tuple(key for key in [invoice_key, *line_keys[:1], *term_keys[:1]] if key)
+                    or (invoice_key,)
+                ),
             )
         ]
 

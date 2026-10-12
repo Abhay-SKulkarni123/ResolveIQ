@@ -186,6 +186,14 @@ class InMemoryCaseRepository:
         """
         self.save(case, expected_version=expected_version)
 
+    def commit(self) -> None:
+        """No-op: the in-memory store has no transaction to settle.
+
+        Present so the service can commit a failed run's tombstone on its own without
+        knowing which adapter it holds. Nothing may read this as durability.
+        """
+        return None
+
     def list_pending_investigations(
         self, *, started_before: datetime
     ) -> tuple[tuple[UUID, UUID], ...]:

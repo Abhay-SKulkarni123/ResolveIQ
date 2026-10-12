@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
 
@@ -61,13 +61,13 @@ from app.pricing.reconciliation import (
     unallocated_payment_total,
 )
 from app.pricing.results import InvoiceRecalculation
-from app.pricing.usage import UsageSummary, summarise_usage
+from app.pricing.usage import UsageSummary
 from app.services.citations import (
     EvidenceCitationValidator,
     InvalidCitationsError,
     ValidatedInterpretation,
 )
-from app.services.evidence_collection import build_evidence_bundle
+from app.services.evidence_collection import build_evidence_bundle, usage_summaries_for
 
 __all__ = [
     "InvestigationResult",
@@ -293,19 +293,6 @@ class InvestigationInputs:
     dispute_text_max_chars: int = 10_000
 
 
-def _summaries_for(invoice: RecordedInvoice, events: Sequence[UsageEvent]) -> list[UsageSummary]:
-    """Usage summaries for every metric that appears on the invoice or in the evidence.
-
-    Keyed off the invoice's own lines rather than off the events, so a metric with no
-    usage evidence still produces a summary of zero. Zero is a real answer meaning "no
-    metered usage in this period", and omitting it would leave the model with a gap it
-    could only read as missing data.
-    """
-    metrics = {line.metric_key for line in invoice.lines}
-    metrics.update(event.metric_key for event in events)
-    return [summarise_usage(metric, list(events), invoice.period) for metric in sorted(metrics)]
-
-
 def _evidence_degradations(
     recalculation: InvoiceRecalculation, balance: OutstandingBalance, payments: list[Payment]
 ) -> list[str]:
@@ -356,7 +343,9 @@ def investigate(
     invoice = inputs.invoice
 
     # 1. Collect. Deterministic, and the only step that reads the live source records.
-    summaries = _summaries_for(invoice, inputs.usage_events)
+    # The summary rule is shared with ``build_bundle_from_document`` so the bundle this
+    # run hashes is the same one the case stored; see ``usage_summaries_for``.
+    summaries = usage_summaries_for(inputs.price_terms, inputs.usage_events, invoice.period)
     evidence = build_evidence_bundle(
         dispute_external_id=inputs.dispute_external_id,
         invoice=invoice,

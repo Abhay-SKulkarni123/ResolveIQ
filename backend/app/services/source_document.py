@@ -53,7 +53,6 @@ from app.domain.contracts import BillingMode
 from app.domain.evidence import EvidenceBundle, EvidenceItem, EvidenceType
 from app.domain.json_frozen import thaw_json
 from app.domain.money import Money
-from app.pricing.usage import summarise_usage
 
 __all__ = [
     "SOURCE_DOCUMENT_VERSION",
@@ -530,13 +529,13 @@ def build_bundle_from_document(
     a pure function of the document, so re-attaching a record already present
     produces a byte-identical bundle and therefore an identical fingerprint.
     """
-    from app.services.evidence_collection import build_evidence_bundle
+    from app.services.evidence_collection import build_evidence_bundle, usage_summaries_for
 
     records = from_source_document(document)
     invoice = records["invoice"]
     terms: list[PriceTerm] = records["price_terms"]
     events: list[UsageEvent] = records["usage_events"]
-    summaries = [summarise_usage(term.metric_key, events, invoice.period) for term in terms]
+    summaries = usage_summaries_for(terms, events, invoice.period)
     bundle = build_evidence_bundle(
         dispute_external_id=dispute_external_id,
         invoice=invoice,

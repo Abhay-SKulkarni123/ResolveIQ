@@ -12,17 +12,33 @@
  * with a 422, because a reviewer who has to decode a server error to find a missing
  * field has been failed twice.
  *
- * The optional record collections the endpoint also accepts (`price_terms`,
- * `payments`, `adjustments`) are not built here. They are supported by the API and
- * can be attached to a live case afterwards; wiring all four ingest collections into
- * one screen would bury the fields a reviewer most often has to hand.
+ * A contract price term is optional too. When one is entered it is stored as
+ * evidence and the engine prices the invoice against it exactly as written -- but
+ * writing it down here does not make it contractual, so the form says so beside the
+ * fields rather than letting the number masquerade as a verified rate. The term's
+ * currency is taken from the invoice, not typed, so a term can never be submitted in
+ * a currency the invoice is not in.
+ *
+ * The remaining ingest collections the endpoint accepts (`payments`,
+ * `adjustments`) are not built here; they are supported by the API and can be
+ * attached to a live case afterwards.
+ *
+ * A usage record's `<input type="datetime-local">` value carries no offset, but the
+ * API refuses an instant it cannot place in the invoice period, so the wall-clock is
+ * written out as an explicit UTC instant before it is sent.
  */
 
 import { useMemo, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
-import type { DisputeSeverity, OpenDisputeRequest } from '../api/types'
+import type {
+  DisputeSeverity,
+  OpenDisputeRequest,
+  PriceTermBillingMode,
+  PriceTermInput,
+} from '../api/types'
 import {
+  Alert,
   Button,
   Field,
   IconButton,
@@ -37,7 +53,13 @@ import { ErrorPanel } from '../components/primitives'
 import { IconPlus, IconX } from '../components/icons'
 
 const AMOUNT_RE = /^-?\d+(\.\d+)?$/
+const NON_NEGATIVE_AMOUNT_RE = /^\d+(\.\d+)?$/
 const CURRENCY_RE = /^[A-Z]{3}$/
+
+const PRICE_TERM_MODES: { value: PriceTermBillingMode; label: string }[] = [
+  { value: 'PER_UNIT', label: 'Per unit' },
+  { value: 'COMMITMENT', label: 'Committed minimum' },
+]
 
 const SEVERITIES: { value: DisputeSeverity; label: string }[] = [
   { value: 'LOW', label: 'Low' },
@@ -77,6 +99,15 @@ interface UsageDraft {
   unit: string
 }
 
+interface PriceTermDraft {
+  id: string
+  metric_key: string
+  billing_mode: PriceTermBillingMode
+  rate: string
+  included_units: string
+  minimum_commitment: string
+}
+
 interface FormState {
   dispute_external_id: string
   contract_external_id: string
@@ -89,11 +120,23 @@ interface FormState {
   period_end: string
   stated_total: string
   lines: LineDraft[]
+  price_terms: PriceTermDraft[]
   usage_events: UsageDraft[]
 }
 
 function blankLine(currency: string): LineDraft {
   return { id: nextRowId(), metric_key: '', line_type: 'USAGE', amount: '', currency }
+}
+
+function blankPriceTerm(): PriceTermDraft {
+  return {
+    id: nextRowId(),
+    metric_key: '',
+    billing_mode: 'PER_UNIT',
+    rate: '',
+    included_units: '',
+    minimum_commitment: '',
+  }
 }
 
 function blankUsage(): UsageDraft {
@@ -121,8 +164,42 @@ function initialState(): FormState {
     period_end: '',
     stated_total: '',
     lines: [blankLine('USD')],
+    price_terms: [],
     usage_events: [],
   }
+}
+
+/**
+ * Render a `<input type="datetime-local">` value as the instant the API requires.
+ *
+ * The control yields a wall-clock with no offset ("2026-03-15T09:00"). The API will
+ * not guess the zone -- an instant it cannot place inside the invoice period is a
+ * billing error waiting to happen -- and the backend's `datetime.fromisoformat`
+ * (Python 3.10) does not read a trailing `Z`. The workbench records every instant in
+ * UTC, so the entered wall-clock is read as UTC and the offset is written out.
+ */
+function toApiInstant(value: string): string {
+  if (value === '') return value
+  if (/[+-]\d{2}:\d{2}$/.test(value)) return value
+  const withSeconds = value.length === 16 ? `${value}:00` : value
+  return `${withSeconds}+00:00`
+}
+
+function buildPriceTerm(term: PriceTermDraft, currency: string): PriceTermInput {
+  const input: PriceTermInput = {
+    metric_key: term.metric_key.trim(),
+    billing_mode: term.billing_mode,
+    currency,
+    included_units: term.included_units.trim() === '' ? '0' : term.included_units.trim(),
+    unit_price: { amount: term.rate.trim(), currency },
+  }
+  if (term.billing_mode === 'COMMITMENT') {
+    return {
+      ...input,
+      minimum_commitment: { amount: term.minimum_commitment.trim(), currency },
+    }
+  }
+  return input
 }
 
 function buildPayload(form: FormState): OpenDisputeRequest {
@@ -145,12 +222,15 @@ function buildPayload(form: FormState): OpenDisputeRequest {
     severity: form.severity,
     description: form.description.trim(),
   }
+  if (form.price_terms.length > 0) {
+    payload.price_terms = form.price_terms.map((term) => buildPriceTerm(term, form.currency))
+  }
   if (form.usage_events.length > 0) {
     payload.usage_events = form.usage_events.map((event) => ({
       external_id: event.external_id.trim(),
       dedupe_key: event.dedupe_key.trim(),
       metric_key: event.metric_key.trim(),
-      occurred_at: event.occurred_at,
+      occurred_at: toApiInstant(event.occurred_at),
       quantity: event.quantity.trim(),
       unit: event.unit.trim(),
     }))
@@ -202,6 +282,25 @@ function validate(form: FormState): { errors: Record<string, string>; payload: O
       errors[`${prefix}.currency`] = `Line ${index + 1}: a three-letter currency code is required.`
     }
   })
+  form.price_terms.forEach((term, index) => {
+    const prefix = `term.${term.id}`
+    const label = `Price term ${index + 1}`
+    if (term.metric_key.trim() === '') {
+      errors[`${prefix}.metric_key`] = `${label}: a metric is required.`
+    }
+    if (!NON_NEGATIVE_AMOUNT_RE.test(term.rate.trim())) {
+      errors[`${prefix}.rate`] = `${label}: a non-negative decimal rate is required, e.g. 0.0013.`
+    }
+    if (term.included_units.trim() !== '' && !NON_NEGATIVE_AMOUNT_RE.test(term.included_units.trim())) {
+      errors[`${prefix}.included_units`] = `${label}: included units must be a non-negative number.`
+    }
+    if (
+      term.billing_mode === 'COMMITMENT' &&
+      !NON_NEGATIVE_AMOUNT_RE.test(term.minimum_commitment.trim())
+    ) {
+      errors[`${prefix}.minimum_commitment`] = `${label}: a committed minimum is required.`
+    }
+  })
   form.usage_events.forEach((event, index) => {
     const prefix = `usage.${event.id}`
     const label = `Usage ${index + 1}`
@@ -247,6 +346,15 @@ export function OpenDispute({ onOpened }: { onOpened: (caseId: string) => void }
       ...current,
       usage_events: current.usage_events.map((event) =>
         event.id === id ? { ...event, ...next } : event,
+      ),
+    }))
+  }
+
+  function updatePriceTerm(id: string, next: Partial<PriceTermDraft>) {
+    setForm((current) => ({
+      ...current,
+      price_terms: current.price_terms.map((term) =>
+        term.id === id ? { ...term, ...next } : term,
       ),
     }))
   }
@@ -505,6 +613,136 @@ export function OpenDispute({ onOpened }: { onOpened: (caseId: string) => void }
 
       <Panel>
         <PanelHeader
+          title="Contract price terms"
+          description="Optional. The rates the engine re-prices the invoice lines against."
+          actions={
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => patch({ price_terms: [...form.price_terms, blankPriceTerm()] })}
+            >
+              <IconPlus size={14} />
+              Add price term
+            </Button>
+          }
+        />
+        {form.price_terms.length === 0 ? (
+          <PanelBody>
+            <p className="text-sm text-ink-muted">
+              No price terms. The engine leaves lines it cannot price unresolved, and the
+              investigation is reported as degraded rather than priced with a rate nobody agreed to.
+            </p>
+          </PanelBody>
+        ) : (
+          <PanelBody className="space-y-3">
+            <Alert tone="info" title="These are test inputs, not a verified contract">
+              A price term entered here is stored as evidence and priced exactly as written. It is
+              not checked against a signed contract, and supplying one does not establish a real
+              contractual rate. The term uses the invoice's currency.
+            </Alert>
+            {form.price_terms.map((term, index) => (
+              <div
+                key={term.id}
+                className="grid items-start gap-3 rounded-lg border border-line bg-surface-subtle p-3 sm:grid-cols-2 lg:grid-cols-3"
+              >
+                <Field
+                  label={`Price metric ${index + 1}`}
+                  error={showError(`term.${term.id}.metric_key`)}
+                  required
+                >
+                  <TextInput
+                    value={term.metric_key}
+                    onChange={(event) => updatePriceTerm(term.id, { metric_key: event.target.value })}
+                    placeholder="api_calls"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label={`Pricing model ${index + 1}`}>
+                  <Select
+                    value={term.billing_mode}
+                    onChange={(event) =>
+                      updatePriceTerm(term.id, {
+                        billing_mode: event.target.value as PriceTermBillingMode,
+                      })
+                    }
+                  >
+                    {PRICE_TERM_MODES.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field
+                  label={`Rate ${index + 1}`}
+                  hint="The amount charged per billable unit."
+                  error={showError(`term.${term.id}.rate`)}
+                  required
+                >
+                  <TextInput
+                    value={term.rate}
+                    onChange={(event) => updatePriceTerm(term.id, { rate: event.target.value })}
+                    inputMode="decimal"
+                    placeholder="0.0013"
+                    className="amount"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field
+                  label={`Included units ${index + 1}`}
+                  hint="Units covered before the rate applies. Defaults to 0."
+                  error={showError(`term.${term.id}.included_units`)}
+                >
+                  <TextInput
+                    value={term.included_units}
+                    onChange={(event) =>
+                      updatePriceTerm(term.id, { included_units: event.target.value })
+                    }
+                    inputMode="decimal"
+                    placeholder="10000"
+                    className="amount"
+                    autoComplete="off"
+                  />
+                </Field>
+                {term.billing_mode === 'COMMITMENT' && (
+                  <Field
+                    label={`Committed minimum ${index + 1}`}
+                    hint="The floor the customer is committed to."
+                    error={showError(`term.${term.id}.minimum_commitment`)}
+                    required
+                  >
+                    <TextInput
+                      value={term.minimum_commitment}
+                      onChange={(event) =>
+                        updatePriceTerm(term.id, { minimum_commitment: event.target.value })
+                      }
+                      inputMode="decimal"
+                      placeholder="1000.00"
+                      className="amount"
+                      autoComplete="off"
+                    />
+                  </Field>
+                )}
+                <div className="flex items-end lg:pt-6">
+                  <IconButton
+                    label={`Remove price term ${index + 1}`}
+                    onClick={() =>
+                      patch({
+                        price_terms: form.price_terms.filter((item) => item.id !== term.id),
+                      })
+                    }
+                  >
+                    <IconX size={15} />
+                  </IconButton>
+                </div>
+              </div>
+            ))}
+          </PanelBody>
+        )}
+      </Panel>
+
+      <Panel>
+        <PanelHeader
           title="Usage records"
           description="Optional. The metered events the invoice is built from, so the engine can re-price them."
           actions={
@@ -553,7 +791,11 @@ export function OpenDispute({ onOpened }: { onOpened: (caseId: string) => void }
                     autoComplete="off"
                   />
                 </Field>
-                <Field label="Occurred at" error={showError(`usage.${event.id}.occurred_at`)}>
+                <Field
+                  label="Occurred at"
+                  hint="Entered and stored in UTC."
+                  error={showError(`usage.${event.id}.occurred_at`)}
+                >
                   <TextInput
                     type="datetime-local"
                     value={event.occurred_at}

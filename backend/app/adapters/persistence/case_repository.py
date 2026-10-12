@@ -294,6 +294,17 @@ class SqlAlchemyCaseRepository:
         self.save(case, expected_version=expected_version)
         self._session.commit()
 
+    def commit(self) -> None:
+        """Settle the current transaction.
+
+        Exposed for the failure path of an investigation. The write-ahead marker was
+        committed on its own (ADR-008), so the ``FAILED`` tombstone that replaces it
+        must be committed on its own too; otherwise the request-level rollback that
+        follows the failure would erase it and leave the case stuck in
+        ``INVESTIGATING`` with a pending run no later request can proceed past.
+        """
+        self._session.commit()
+
     def list_pending_investigations(
         self, *, started_before: datetime
     ) -> tuple[tuple[UUID, UUID], ...]:

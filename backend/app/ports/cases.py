@@ -113,6 +113,20 @@ class CaseRepository(Protocol):
         """
         ...
 
+    def commit(self) -> None:
+        """Make the current unit of work durable.
+
+        The second documented exception to "one transaction per request", alongside
+        :meth:`begin_investigation`. The write-ahead marker is committed on its own
+        before the workflow runs, so the tombstone that replaces it when the run fails
+        must be committed on its own too: otherwise the request-level rollback that
+        follows the failure would erase the tombstone and leave the case stuck in
+        ``INVESTIGATING`` behind a pending run no later request can get past.
+
+        For implementations without transactions this is a no-op.
+        """
+        ...
+
     def list_pending_investigations(
         self, *, started_before: datetime
     ) -> tuple[tuple[UUID, UUID], ...]:

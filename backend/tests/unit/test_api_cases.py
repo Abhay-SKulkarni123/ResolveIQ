@@ -27,6 +27,7 @@ to read the settings file to know their data is ephemeral.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -1041,3 +1042,174 @@ def test_a_failed_commit_still_closes_the_session(monkeypatch: pytest.MonkeyPatc
         next(generator)
 
     assert session.closed is True
+
+
+# ---------------------------------------------------------------------------
+# A synthetic contract price term, priced end to end over HTTP
+# ---------------------------------------------------------------------------
+#
+# The Open Dispute form now collects contract price terms. These tests post the exact
+# request shape it sends -- a PER_UNIT term with an included-unit allowance -- and pin
+# the result to ``Decimal`` rather than to whatever float a sum would produce. The rate
+# is a deliberately synthetic test figure; it is not CON-TEST-001's rate and is not a
+# real contract term.
+
+SYNTHETIC_RATE = "0.0013"
+
+
+def priced_payload(dispute_external_id: str = "DSC-SYN-1") -> dict[str, Any]:
+    """A synthetic invoice, one matching usage event, and one PER_UNIT term.
+
+    41234 units at 0.0013 with a 10000-unit allowance is chosen so the exact product
+    (40.6042) needs a real rounding step, which a float sum would hide.
+    """
+    return {
+        "dispute_external_id": dispute_external_id,
+        "description": "Synthetic pricing check.",
+        "invoice": {
+            "external_id": "INV-SYN-1",
+            "currency": "USD",
+            "period_start": "2026-03-01",
+            "period_end": "2026-03-31",
+            "stated_total": {"amount": "28.40", "currency": "USD"},
+            "lines": [
+                {
+                    "metric_key": "api_calls",
+                    "line_type": "USAGE",
+                    "recorded_amount": {"amount": "28.40", "currency": "USD"},
+                }
+            ],
+        },
+        "contract_external_id": "CTR-SYN-API",
+        "dispute_text": "Synthetic pricing check.",
+        "severity": "MEDIUM",
+        "price_terms": [
+            {
+                "metric_key": "api_calls",
+                "billing_mode": "PER_UNIT",
+                "currency": "USD",
+                "included_units": "10000",
+                "unit_price": {"amount": SYNTHETIC_RATE, "currency": "USD"},
+            }
+        ],
+        "usage_events": [
+            {
+                "external_id": "USE-SYN-1",
+                "dedupe_key": "DK-USE-SYN-1",
+                "metric_key": "api_calls",
+                "occurred_at": "2026-03-15T09:00:00+00:00",
+                "quantity": "41234",
+                "unit": "calls",
+            }
+        ],
+    }
+
+
+def test_a_synthetic_price_term_prices_the_invoice_with_decimal_arithmetic(
+    client: TestClient,
+) -> None:
+    created = client.post("/api/v1/disputes", json=priced_payload()).json()
+
+    run = client.post(f"/api/v1/disputes/{created['id']}/investigations", json={})
+    assert run.status_code == 201, run.text
+    body = run.json()
+
+    # (41234 - 10000) * 0.0013 = 40.6042, rounded once at the line boundary to 40.60.
+    calculation = body["calculation"]
+    assert Decimal(calculation["recalculated_total"]) == Decimal("40.60")
+    assert Decimal(calculation["recorded_total"]) == Decimal("28.40")
+    assert Decimal(calculation["difference"]) == Decimal("12.20")
+    assert calculation["currency"] == "USD"
+    assert calculation["unresolved_metrics"] == []
+    assert calculation["is_provisional"] is False
+
+
+def test_the_synthetic_term_is_stored_as_contract_term_evidence(client: TestClient) -> None:
+    created = client.post("/api/v1/disputes", json=priced_payload()).json()
+    body = client.post(f"/api/v1/disputes/{created['id']}/investigations", json={}).json()
+
+    by_key = {item["natural_key"]: item for item in body["evidence"]}
+    key = "contract:CTR-SYN-API#term:api_calls"
+    assert key in by_key, sorted(by_key)
+    assert by_key[key]["evidence_type"] == "CONTRACT_TERM"
+    assert by_key[key]["snapshot"]["unit_price"] == SYNTHETIC_RATE
+
+
+def test_a_finding_cites_only_evidence_that_is_on_the_case(client: TestClient) -> None:
+    created = client.post("/api/v1/disputes", json=priced_payload()).json()
+    body = client.post(f"/api/v1/disputes/{created['id']}/investigations", json={}).json()
+
+    allowed = {item["natural_key"] for item in body["evidence"]}
+    for finding in body["findings"]:
+        assert finding["supporting_evidence"], finding["code"]
+        assert set(finding["supporting_evidence"]) <= allowed
+
+
+def test_the_recalculation_finding_cites_the_contract_term_it_used(client: TestClient) -> None:
+    """A finding that says the invoice was re-priced from contract terms must point
+    at the term it used, not only at the invoice."""
+    created = client.post("/api/v1/disputes", json=priced_payload("DSC-SYN-CITE")).json()
+    body = client.post(f"/api/v1/disputes/{created['id']}/investigations", json={}).json()
+
+    summary = next(f for f in body["findings"] if f["code"] == "MOCK_RECALCULATION_SUMMARY")
+    assert "contract:CTR-SYN-API#term:api_calls" in summary["supporting_evidence"]
+
+
+def test_a_case_without_a_price_term_is_degraded_not_mispriced(client: TestClient) -> None:
+    """No term must not become a zero-rate charge dressed up as a clean total."""
+    payload = priced_payload("DSC-SYN-NOTERM")
+    del payload["price_terms"]
+    created = client.post("/api/v1/disputes", json=payload).json()
+
+    body = client.post(f"/api/v1/disputes/{created['id']}/investigations", json={}).json()
+
+    assert body["status"] == "DEGRADED"
+    assert body["calculation"]["unresolved_metrics"] == ["api_calls"]
+    assert Decimal(body["calculation"]["recalculated_total"]) == Decimal("0.00")
+    assert body["calculation"]["is_provisional"] is True
+
+
+def test_the_priced_case_still_waits_for_a_review(client: TestClient) -> None:
+    """A synthetic term buys a calculation, never a verdict."""
+    created = client.post("/api/v1/disputes", json=priced_payload("DSC-SYN-REVIEW")).json()
+    client.post(f"/api/v1/disputes/{created['id']}/investigations", json={})
+
+    detail = client.get(f"/api/v1/disputes/{created['id']}").json()
+    assert detail["status"] == "AWAITING_REVIEW"
+
+    decision = client.post(
+        f"/api/v1/disputes/{created['id']}/decision",
+        json={"decision": "RESOLVED", "rationale": "synthetic case looks right"},
+    )
+    assert decision.status_code == 409
+    assert decision.json()["error"]["code"] == "INVALID_TRANSITION"
+
+
+def test_a_naive_usage_timestamp_is_refused_so_the_zone_is_never_guessed(
+    client: TestClient,
+) -> None:
+    """The contract the Open Dispute form has to satisfy.
+
+    ``<input type="datetime-local">`` yields a wall-clock with no offset. The API
+    refuses it rather than assuming UTC or local time, because an instant it cannot
+    place inside the invoice period is a billing error waiting to happen. The form
+    therefore writes the offset out before it sends; this pins the reason.
+    """
+    payload = priced_payload("DSC-SYN-NAIVE")
+    payload["usage_events"][0]["occurred_at"] = "2026-03-15T09:00"
+
+    response = client.post("/api/v1/disputes", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_USAGE_EVENT"
+
+
+def test_a_trailing_z_is_not_read_by_the_timestamp_parser(client: TestClient) -> None:
+    """Python 3.10's ``fromisoformat`` wants ``+00:00``; ``Z`` is a 422, not a shrug."""
+    payload = priced_payload("DSC-SYN-Z")
+    payload["usage_events"][0]["occurred_at"] = "2026-03-15T09:00:00Z"
+
+    response = client.post("/api/v1/disputes", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_TIMESTAMP"
