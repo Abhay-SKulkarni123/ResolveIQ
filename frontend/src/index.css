@@ -6,12 +6,35 @@
   color-scheme: light;
 }
 
+/*
+ * The single global typography rule. Every user-visible character in the
+ * application — headings, body copy, form labels and controls, tables, evidence
+ * keys, status labels, dialogs and error messages — renders in Times New Roman.
+ * It is declared on `html` so the whole document inherits it, and `font-sans` /
+ * `font-mono` (tailwind.config.js) resolve to the same stack so no utility
+ * reintroduces a different family.
+ */
 html {
   -webkit-text-size-adjust: 100%;
+  font-family: "Times New Roman", Times, serif;
 }
 
 body {
   @apply bg-canvas text-ink font-sans antialiased;
+}
+
+/*
+ * Tailwind's preflight already makes form controls inherit their font, but the
+ * requirement is explicit: buttons, inputs, selects and textareas must not fall
+ * back to the browser's or any component library's default font. `inherit` is
+ * set on the family only, so control sizing and weight are untouched.
+ */
+button,
+input,
+optgroup,
+select,
+textarea {
+  font-family: inherit;
 }
 
 /*

@@ -1,0 +1,45 @@
+# ResolveIQ — demo / evaluation deployment overlay.
+#
+# This is an OVERLAY. It is layered on top of the local-development
+# docker-compose.yml, which stays the single source of truth for images, health
+# checks and service names:
+#
+#   # 1. build and start the database first, then migrate as its own step
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build db
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml run --rm api alembic upgrade head
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d api web-prod
+#
+# What it changes, and why:
+#   * db       — does NOT publish 5432 to the host. A demo box should not expose
+#                the database; only the api container reaches it, over the
+#                internal network.
+#   * api      — runs the built image with NO bind mount and NO --reload, so the
+#                running code is the image, not a working copy. APP_ENV=production
+#                disables SQL echo and any development-only behaviour.
+#   * web-prod — unchanged: nginx serving the compiled bundle and proxying /api.
+#
+# THIS IS A DEMO CONFIGURATION, NOT A PRODUCTION ONE. Two things in particular are
+# deliberate and must not be mistaken for readiness:
+#   1. DEMO_IDENTITY_ENABLED=true keeps the spoofable X-Actor-Id / X-Actor-Role
+#      header identity. There is no real authentication in this build.
+#   2. LLM_PROVIDER is fixed to `mock`. No hosted model is contacted.
+# See DEPLOYMENT.md §Production blockers before exposing this to anyone but
+# yourself or a small evaluation audience.
+
+services:
+  db:
+    # Do not publish the database port. `!reset` clears the base file's mapping.
+    ports: !reset []
+
+  api:
+    # Run the image, not the bind-mounted working copy, and without hot reload.
+    volumes: !reset []
+    command: !override ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      APP_ENV: production
+      CASE_STORE: postgres
+      # Demo-only identity. Real authentication is a production blocker.
+      DEMO_IDENTITY_ENABLED: "true"
+      # The nginx service (web-prod) is published on 8080; that origin is what a
+      # browser calls from, so it is the one allowed to call the API.
+      CORS_ORIGINS: "http://localhost:8080"

@@ -1,0 +1,26 @@
+# Keep the frontend build context small and secret-free.
+#
+# The build stage copies package.json, package-lock.json and the source files it
+# needs (see Dockerfile). This file makes it impossible to sweep a local .env, an
+# existing node_modules/ or a previous dist/ into the context.
+
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+coverage/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local environment and credentials — never in an image. Vite inlines VITE_*
+# variables at build time, so a .env in the context is a real leak risk.
+.env
+.env.*
+*.pem
+*.key
+
+# VCS and local-only docs.
+.git
+.gitignore
+docs/

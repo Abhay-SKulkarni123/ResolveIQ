@@ -1,0 +1,36 @@
+# Keep the backend build context small and secret-free.
+#
+# The image only ever needs app/, scripts/, alembic.ini and migrations/ (see
+# Dockerfile). This file is defence in depth: it guarantees a local .env, a
+# virtualenv, caches or test databases can never be swept into the context even
+# if a COPY rule is later widened.
+
+# Local environment and credentials — never in an image.
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# Python artefacts and caches.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Tests and local tooling are not needed at runtime.
+tests/
+
+# VCS and local-only docs.
+.git
+.gitignore
+docs/

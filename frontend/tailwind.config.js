@@ -77,27 +77,15 @@ export default {
           text: '#5c636e',
         },
       },
+      // The brief is that every user-visible character renders in Times New
+      // Roman, so `sans` and `mono` deliberately resolve to the same serif stack.
+      // `mono` is kept as a token (rather than deleted) because identifiers,
+      // evidence keys and JSON snapshots are still set with the `font-mono`
+      // utility. `.amount` additionally keeps `tabular-nums`, which Times New
+      // Roman's fixed-width figures honour, so money columns stay aligned.
       fontFamily: {
-        sans: [
-          'Inter',
-          'ui-sans-serif',
-          'system-ui',
-          '-apple-system',
-          'Segoe UI',
-          'Roboto',
-          'Helvetica Neue',
-          'Arial',
-          'sans-serif',
-        ],
-        mono: [
-          'ui-monospace',
-          'SFMono-Regular',
-          'SF Mono',
-          'Menlo',
-          'Consolas',
-          'Liberation Mono',
-          'monospace',
-        ],
+        sans: ['"Times New Roman"', 'Times', 'serif'],
+        mono: ['"Times New Roman"', 'Times', 'serif'],
       },
       fontSize: {
         '2xs': ['0.6875rem', { lineHeight: '1rem' }],
